@@ -1,0 +1,883 @@
+so we have after leaving them running all night in vs import numpy as np
+import networkx as nx
+from networkx.algorithms import approximation as approx
+import time, csv
+from numba import njit
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+GRID = 512
+SEEDS = 10             # reduce if Colab struggles
+TEST_SIZES = [100, 300]  # real Christofides becomes too slow above 300
+
+
+# ============================================================
+# CORE HELPERS (Numba accelerated)
+# ============================================================
+@njit
+def dist(a, b):
+    return ((a[0]-b[0])**2 + (a[1]-b[1])**2)**0.5
+
+def tour_length(order, coords):
+    total = 0.0
+    for i in range(len(order)-1):
+        total += dist(coords[order[i]], coords[order[i+1]])
+    return total
+
+
+# ============================================================
+# 2.5-opt
+# ============================================================
+def two_point_five_opt(route, coords):
+    improved = True
+    n = len(route)
+    while improved:
+        improved = False
+        for i in range(1, n-2):
+            for j in range(i+2, n-1):
+                A, B = route[i-1], route[i]
+                C, D = route[j], route[j+1]
+
+                old = dist(coords[A], coords[B]) + dist(coords[C], coords[D])
+                new = dist(coords[A], coords[C]) + dist(coords[B], coords[D])
+
+                if new < old:
+                    route[i:j+1] = reversed(route[i:j+1])
+                    improved = True
+                    continue
+
+                new_route = route.copy()
+                node = new_route.pop(i)
+                new_route.insert(j, node)
+
+                if tour_length(new_route, coords) < tour_length(route, coords):
+                    route = new_route
+                    improved = True
+    return route
+
+
+# ============================================================
+# 3-opt
+# ============================================================
+def three_opt(route, coords):
+    n = len(route)
+
+    def seg_len(i, j):
+        return dist(coords[route[i]], coords[route[j]])
+
+    improved = True
+    while improved:
+        improved = False
+        for i in range(0, n-3):
+            for j in range(i+2, n-2):
+                for k in range(j+2, n-1):
+                    old_cost = (
+                        seg_len(i, i+1) +
+                        seg_len(j, j+1) +
+                        seg_len(k, k+1)
+                    )
+
+                    # Variant 1
+                    r1 = route.copy()
+                    r1[i+1:j+1] = reversed(r1[i+1:j+1])
+                    c1 = (
+                        dist(coords[r1[i]], coords[r1[i+1]]) +
+                        dist(coords[r1[j]], coords[r1[j+1]]) +
+                        dist(coords[r1[k]], coords[r1[k+1]])
+                    )
+
+                    # Variant 2
+                    r2 = route.copy()
+                    r2[j+1:k+1] = reversed(r2[j+1:k+1])
+                    c2 = (
+                        dist(coords[r2[i]], coords[r2[i+1]]) +
+                        dist(coords[r2[j]], coords[r2[j+1]]) +
+                        dist(coords[r2[k]], coords[r2[k+1]])
+                    )
+
+                    # Variant 3
+                    r3 = route.copy()
+                    r3[i+1:j+1] = reversed(r3[i+1:j+1])
+                    r3[j+1:k+1] = reversed(r3[j+1:k+1])
+                    c3 = (
+                        dist(coords[r3[i]], coords[r3[i+1]]) +
+                        dist(coords[r3[j]], coords[r3[j+1]]) +
+                        dist(coords[r3[k]], coords[r3[k+1]])
+                    )
+
+                    best = min(c1, c2, c3)
+                    if best < old_cost - 1e-12:
+                        if best == c1: route = r1
+                        elif best == c2: route = r2
+                        else: route = r3
+                        improved = True
+    return route
+
+
+# ============================================================
+# FULL MTS–Γ C4 (your exact refinement pipeline)
+# ============================================================
+def mts_gamma_C4(coords):
+    order = list(np.argsort(coords[:,0]))  # initial naive ordering
+
+    improved = True
+    best_len = tour_length(order, coords)
+
+    while improved:
+        improved = False
+
+        order = two_point_five_opt(order, coords)
+        order = three_opt(order, coords)
+
+        new_len = tour_length(order, coords)
+        if new_len < best_len:
+            best_len = new_len
+            improved = True
+
+    return order, best_len
+
+
+# ============================================================
+# REAL CHRISTOFIDES (NetworkX)
+# ============================================================
+def real_christofides(coords):
+    N = len(coords)
+    G = nx.Graph()
+    for i in range(N):
+        for j in range(i+1, N):
+            G.add_edge(i, j, weight=float(dist(coords[i], coords[j])))
+    route = approx.christofides(G)
+    return tour_length(route, coords)
+
+
+# ============================================================
+# STABILITY TEST (REAL apples-to-apples)
+# ============================================================
+print("Running REAL apples-to-apples stability tests...\n")
+
+rows = [["N","Seed","Christofides","MTS_Gamma","Improvement_%","Runtime_sec"]]
+
+for N in TEST_SIZES:
+    print(f"\n===== Testing N = {N} =====")
+    for seed in range(SEEDS):
+        np.random.seed(seed)
+        coords = np.random.rand(N,2)*(GRID-4)
+
+        # Real Christofides
+        c_len = real_christofides(coords)
+
+        # Real MTS–Γ C4
+        t0 = time.time()
+        _, m_len = mts_gamma_C4(coords)
+        t1 = time.time()
+
+        imp = (c_len - m_len) / c_len * 100
+        print(f"Seed {seed:02d}: {imp:+.2f}%")
+
+        rows.append([N, seed, c_len, m_len, imp, t1-t0])
+
+# Save results
+with open("mts_gamma_real_stability.csv", "w", newline="") as f:
+    csv.writer(f).writerows(rows)
+
+print("\nSaved → mts_gamma_real_stability.csv")  Running REAL apples-to-apples stability tests...
+
+
+===== Testing N = 100 =====
+Seed 00: +9.44%
+Seed 01: -0.27%
+Seed 02: +7.69%
+Seed 03: +2.00%
+Seed 04: +7.06%
+Seed 05: +5.04%
+Seed 06: +4.67%
+Seed 07: +4.80%
+Seed 08: +8.70%
+Seed 09: +5.59%
+
+===== Testing N = 300 =====
+Seed 00: -0.36%
+Seed 01: +5.61%
+Seed 02: +4.84%
+Seed 03: +2.93%
+Seed 04: +3.08%
+Seed 05: +4.15%
+Seed 06: +3.97%
+Seed 07: +9.54%
+Seed 08: +5.34%
+Seed 09: +3.58%
+
+Saved → mts_gamma_real_stability.csv   import numpy as np
+import time
+import csv
+import networkx as nx
+from networkx.algorithms import approximation as approx
+from numba import njit
+
+# ============================================================
+# CORE DEFINITIONS (NO DEPENDENCIES)
+# ============================================================
+
+GRID = 512
+
+@njit
+def dist(a, b):
+    return ((a[0]-b[0])**2 + (a[1]-b[1])**2)**0.5
+
+def tour_length(order, coords):
+    total = 0.0
+    for i in range(len(order)-1):
+        a = coords[order[i]]
+        b = coords[order[i+1]]
+        total += dist(a, b)
+    return total
+
+# ----------------------------
+# 2.5-opt
+# ----------------------------
+def two_point_five_opt(route, coords):
+    improved = True
+    n = len(route)
+
+    while improved:
+        improved = False
+        for i in range(1, n-2):
+            for j in range(i+2, n-1):
+
+                A, B = route[i-1], route[i]
+                C, D = route[j], route[j+1]
+
+                old = dist(coords[A], coords[B]) + dist(coords[C], coords[D])
+                new = dist(coords[A], coords[C]) + dist(coords[B], coords[D])
+
+                if new < old:
+                    route[i:j+1] = reversed(route[i:j+1])
+                    improved = True
+                    continue
+
+                new_route = route.copy()
+                node = new_route.pop(i)
+                new_route.insert(j, node)
+
+                if tour_length(new_route, coords) < tour_length(route, coords):
+                    route = new_route
+                    improved = True
+                    continue
+
+    return route
+
+# ----------------------------
+# 3-opt
+# ----------------------------
+def three_opt(route, coords):
+    n = len(route)
+
+    def seg_len(i, j):
+        return dist(coords[route[i]], coords[route[j]])
+
+    improved = True
+    while improved:
+        improved = False
+
+        for i in range(0, n - 3):
+            for j in range(i + 2, n - 2):
+                for k in range(j + 2, n - 1):
+
+                    old_cost = seg_len(i,i+1)+seg_len(j,j+1)+seg_len(k,k+1)
+
+                    r1 = route.copy()
+                    r1[i+1:j+1] = reversed(r1[i+1:j+1])
+                    c1 = (seg_len(i,i+1)+seg_len(j,j+1)+seg_len(k,k+1))
+
+                    r2 = route.copy()
+                    r2[j+1:k+1] = reversed(r2[j+1:k+1])
+                    c2 = (seg_len(i,i+1)+seg_len(j,j+1)+seg_len(k,k+1))
+
+                    r3 = route.copy()
+                    r3[i+1:j+1] = reversed(r3[i+1:j+1])
+                    r3[j+1:k+1] = reversed(r3[j+1:k+1])
+                    c3 = (seg_len(i,i+1)+seg_len(j,j+1)+seg_len(k,k+1))
+
+                    best = min(c1, c2, c3)
+                    if best < old_cost - 1e-12:
+                        if best == c1: route = r1
+                        elif best == c2: route = r2
+                        else: route = r3
+                        improved = True
+
+    return route
+
+# ----------------------------
+# FULL REFINEMENT (C4)
+# ----------------------------
+def mts_gamma_C4(coords):
+
+    # Initial naive ordering (sorted by x)
+    order = list(np.argsort(coords[:,0]))
+
+    # Refinement cycle
+    improved = True
+    old_len = tour_length(order, coords)
+
+    while improved:
+        improved = False
+
+        order = two_point_five_opt(order, coords)
+        order = three_opt(order, coords)
+
+        new_len = tour_length(order, coords)
+        if new_len < old_len:
+            improved = True
+            old_len = new_len
+
+    return order, old_len
+
+
+# ============================================================
+# STABILITY TEST PARAMETERS
+# ============================================================
+SEEDS = 50
+TEST_SIZES = [100, 300, 500, 1000]
+
+output_file = "mts_gamma_stability_results.csv"
+
+print("Running MTS–Γ C4 stability tests…\n")
+rows = [["N","Seed","Christofides","MTS_Gamma","Improvement_%","Runtime_sec"]]
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+for N in TEST_SIZES:
+    print(f"\n===== Testing N = {N} with {SEEDS} seeds =====")
+    
+    for seed in range(SEEDS):
+        np.random.seed(seed)
+        coords = np.random.rand(N,2)*(GRID-4)
+
+        # Christofides
+        G = nx.Graph()
+        for i in range(N):
+            for j in range(i+1, N):
+                G.add_edge(i, j, weight=float(dist(coords[i], coords[j])))
+
+        c_route = approx.christofides(G)
+        c_len = tour_length(c_route, coords)
+
+        # MTS Γ C4
+        start = time.time()
+        mts_route, mts_len = mts_gamma_C4(coords)
+        end = time.time()
+
+        imp = (c_len - mts_len)/c_len * 100
+        print(f"Seed {seed:02d}: +{imp:.2f}%")
+
+        rows.append([N, seed, c_len, mts_len, imp, end-start])
+
+# Write CSV
+with open(output_file, "w", newline="") as f:
+    csv.writer(f).writerows(rows)
+
+print("\nSaved stability results →", output_file) Running MTS–Γ C4 stability tests…
+
+
+===== Testing N = 100 with 50 seeds =====
+Seed 00: +5.67%
+Seed 01: +-5.40%
+Seed 02: +2.78%
+Seed 03: +-0.63%
+Seed 04: +2.58%
+Seed 05: +0.27%
+Seed 06: +-1.40%
+Seed 07: +-3.06%
+Seed 08: +1.14%
+Seed 09: +3.93%
+Seed 10: +3.78%
+Seed 11: +3.12%
+Seed 12: +1.97%
+Seed 13: +-6.11%
+Seed 14: +0.53%
+Seed 15: +4.13%
+Seed 16: +2.35%
+Seed 17: +2.87%
+Seed 18: +-0.94%
+Seed 19: +7.59%
+Seed 20: +1.34%
+Seed 21: +1.32%
+Seed 22: +0.07%
+Seed 23: +1.57%
+Seed 24: +-4.80%
+Seed 25: +3.18%
+Seed 26: +8.68%
+Seed 27: +6.23%
+Seed 28: +-2.34%
+Seed 29: +-1.80%
+Seed 30: +2.69%
+Seed 31: +0.19%
+Seed 32: +2.66%
+Seed 33: +4.47%
+Seed 34: +-1.15%
+Seed 35: +4.25%
+Seed 36: +1.31%
+Seed 37: +0.15%
+Seed 38: +4.64%
+Seed 39: +-2.09%
+Seed 40: +1.49%
+Seed 41: +6.71%
+Seed 42: +0.73%
+Seed 43: +5.75%
+Seed 44: +3.49%
+Seed 45: +1.06%
+Seed 46: +1.50%
+Seed 47: +2.15%
+Seed 48: +2.09%
+Seed 49: +7.03%
+
+===== Testing N = 300 with 50 seeds =====
+Seed 00: +-4.37%
+Seed 01: +2.98%
+Seed 02: +0.66%
+Seed 03: +-1.30%
+Seed 04: +-1.72%
+Seed 05: +0.24%
+Seed 06: +3.14%
+Seed 07: +7.14%
+Seed 08: +0.96%
+Seed 09: +0.35%
+Seed 10: +2.72%
+Seed 11: +-1.77%
+Seed 12: +3.28%
+Seed 13: +1.38%
+Seed 14: +-0.26%
+Seed 15: +3.27%
+Seed 16: +-3.37%
+Seed 17: +-1.46%
+Seed 18: +2.30%
+Seed 19: +2.67%
+Seed 20: +4.19%
+Seed 21: +-0.47%
+Seed 22: +2.14%
+Seed 23: +1.74%
+Seed 24: +-0.04%
+Seed 25: +-0.75%
+Seed 26: +-4.11%
+Seed 27: +-0.91%
+Seed 28: +2.00%
+Seed 29: +-2.93%
+Seed 30: +-0.01%
+Seed 31: +0.56%
+Seed 32: +0.84%
+Seed 33: +-0.91%
+Seed 34: +-1.39%
+Seed 35: +5.57%
+Seed 36: +0.96%
+Seed 37: +-0.32%
+Seed 38: +0.61%
+Seed 39: +1.19%
+Seed 40: +-0.19%
+Seed 41: +2.72%
+Seed 42: +-0.52%
+Seed 43: +1.51%
+Seed 44: +2.07%
+Seed 45: +-0.42%
+Seed 46: +-1.65%
+Seed 47: +-1.39%
+Seed 48: +2.68%
+Seed 49: +1.92%
+
+===== Testing N = 500 with 50 seeds =====
+Seed 00: +1.62%
+Seed 01: +1.24%
+Seed 02: +0.84%
+Seed 03: +0.72%
+Seed 04: +0.43%
+Seed 05: +2.84%
+Seed 06: +2.35%    import numpy as np
+import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter
+import networkx as nx
+from networkx.algorithms import approximation as approx
+import math
+import itertools
+import csv
+
+# ================================================================
+# BASE CONFIG
+# ================================================================
+GRID = 512
+N = 100
+N_TRIALS = 5
+
+# Search ranges to sweep
+GAMMA_LIST = [0.14, 0.16, 0.18, 0.20]
+ITER_GAMMA_LIST = [400, 600, 800]
+FLOW_STEPS_LIST = [400, 600, 800]
+STEP_SIZE_LIST = [0.8, 1.2, 1.6]
+SMOOTH_FINE_LIST = [1.5, 2.0, 2.5]
+
+
+# ================================================================
+# BASIC HELPERS
+# ================================================================
+def euclid(a, b):
+    return np.linalg.norm(a - b)
+
+def tour_length(order, coords):
+    return sum(
+        np.linalg.norm(coords[order[i]] - coords[order[i+1]])
+        for i in range(len(order)-1)
+    )
+
+
+# ================================================================
+# 2.5-OPT
+# ================================================================
+def two_point_five_opt(route, coords):
+    improved = True
+    n = len(route)
+
+    while improved:
+        improved = False
+        for i in range(1, n-2):
+            for j in range(i+2, n-1):
+
+                A, B = route[i-1], route[i]
+                C, D = route[j], route[j+1]
+
+                old = (euclid(coords[A], coords[B]) +
+                       euclid(coords[C], coords[D]))
+
+                new = (euclid(coords[A], coords[C]) +
+                       euclid(coords[B], coords[D]))
+
+                if new < old:
+                    route[i:j+1] = reversed(route[i:j+1])
+                    improved = True
+                    continue
+
+                new_route = route.copy()
+                node = new_route.pop(i)
+                new_route.insert(j, node)
+
+                if tour_length(new_route, coords) < tour_length(route, coords):
+                    route = new_route
+                    improved = True
+                    continue
+
+    return route
+
+
+# ================================================================
+# SAFE 3-OPT
+# ================================================================
+def three_opt(route, coords):
+    n = len(route)
+
+    def seg_len(a, b):
+        return np.linalg.norm(coords[route[a]] - coords[route[b]])
+
+    improved = True
+    while improved:
+        improved = False
+
+        for i in range(0, n - 3):
+            for j in range(i + 2, n - 2):
+                for k in range(j + 2, n - 1):
+
+                    old_cost = (
+                        seg_len(i, i+1) +
+                        seg_len(j, j+1) +
+                        seg_len(k, k+1)
+                    )
+
+                    r1 = route.copy()
+                    r1[i+1:j+1] = reversed(r1[i+1:j+1])
+                    c1 = (np.linalg.norm(coords[r1[i]] - coords[r1[i+1]]) +
+                          np.linalg.norm(coords[r1[j]] - coords[r1[j+1]]) +
+                          np.linalg.norm(coords[r1[k]] - coords[r1[k+1]]))
+
+                    r2 = route.copy()
+                    r2[j+1:k+1] = reversed(r2[j+1:k+1])
+                    c2 = (np.linalg.norm(coords[r2[i]] - coords[r2[i+1]]) +
+                          np.linalg.norm(coords[r2[j]] - coords[r2[j+1]]) +
+                          np.linalg.norm(coords[r2[k]] - coords[r2[k+1]]))
+
+                    r3 = route.copy()
+                    r3[i+1:j+1] = reversed(r3[i+1:j+1])
+                    r3[j+1:k+1] = reversed(r3[j+1:k+1])
+                    c3 = (np.linalg.norm(coords[r3[i]] - coords[r3[i+1]]) +
+                          np.linalg.norm(coords[r3[j]] - coords[r3[j+1]]) +
+                          np.linalg.norm(coords[r3[k]] - coords[r3[k+1]]))
+
+                    best = min(c1, c2, c3)
+                    if best < old_cost - 1e-12:
+                        if best == c1:
+                            route = r1
+                        elif best == c2:
+                            route = r2
+                        else:
+                            route = r3
+                        improved = True
+
+    return route
+
+
+# ================================================================
+# FULL HYBRID REFINEMENT (C3)
+# ================================================================
+def full_refinement(route, coords):
+    improved = True
+    last_length = tour_length(route, coords)
+
+    while improved:
+        improved = False
+        route = two_point_five_opt(route, coords)
+        route = three_opt(route, coords)
+        route = two_point_five_opt(route, coords)
+
+        new_length = tour_length(route, coords)
+        if new_length < last_length - 1e-9:
+            improved = True
+            last_length = new_length
+
+    return route
+
+
+# ================================================================
+# CURVATURE FIELD
+# ================================================================
+def build_field(coords, gamma, iter_gamma, smooth_fine):
+    F = np.zeros((GRID, GRID))
+
+    for x, y in coords:
+        F[int(y), int(x)] += 1.0
+
+    F = gaussian_filter(F, smooth_fine)
+
+    for _ in range(iter_gamma):
+        lap = (
+            np.roll(F,1,0)+np.roll(F,-1,0)+np.roll(F,1,1)+np.roll(F,-1,1)
+            - 4*F
+        )
+        F += gamma * lap
+        F[F < 0] = 0
+
+    return gaussian_filter(F, 1.0)
+
+
+# ================================================================
+# GRADIENT FLOW ORDERING
+# ================================================================
+def gradient_flow_ordering(F, coords, flow_steps, step_size):
+
+    grad_y, grad_x = np.gradient(F)
+    flow_val = np.zeros(len(coords))
+
+    for i in range(len(coords)):
+        x, y = coords[i]
+        x = float(np.clip(x, 1, GRID-2))
+        y = float(np.clip(y, 1, GRID-2))
+
+        for _ in range(flow_steps):
+
+            xi = int(x)
+            yi = int(y)
+
+            gx = grad_x[yi, xi]
+            gy = grad_y[yi, xi]
+
+            mag = math.hypot(gx, gy)
+            if mag < 1e-9:
+                break
+
+            x += step_size * gx / mag
+            y += step_size * gy / mag
+
+            x = float(np.clip(x, 1, GRID-2))
+            y = float(np.clip(y, 1, GRID-2))
+
+        flow_val[i] = F[int(y), int(x)]
+
+    return np.argsort(-flow_val)
+
+
+# ================================================================
+# FULL SOLVER
+# ================================================================
+def mts_solver(coords, gamma, iter_gamma, smooth_fine, flow_steps, step_size):
+
+    F = build_field(coords, gamma, iter_gamma, smooth_fine)
+    order = list(gradient_flow_ordering(F, coords, flow_steps, step_size))
+    order = full_refinement(order, coords)
+
+    return order, tour_length(order, coords)
+
+
+# ================================================================
+# RUN PARAMETER SWEEP
+# ================================================================
+results = []
+
+sweep_space = list(itertools.product(
+    GAMMA_LIST,
+    ITER_GAMMA_LIST,
+    SMOOTH_FINE_LIST,
+    FLOW_STEPS_LIST,
+    STEP_SIZE_LIST
+))
+
+print(f"\nSweeping {len(sweep_space)} configurations...\n")
+
+for (gamma, iter_gamma, smooth_fine, flow_steps, step_size) in sweep_space:
+    trial_lengths = []
+
+    for t in range(N_TRIALS):
+        coords = np.random.rand(N,2) * (GRID-4)
+
+        G = nx.Graph()
+        for i in range(N):
+            for j in range(i+1, N):
+                G.add_edge(i, j, weight=float(euclid(coords[i], coords[j])))
+
+        c_route = approx.christofides(G)
+        c_len = tour_length(c_route, coords)
+
+        mts_route, mts_len = mts_solver(
+            coords, gamma, iter_gamma, smooth_fine, flow_steps, step_size
+        )
+
+        trial_lengths.append((c_len, mts_len))
+
+    arr = np.array(trial_lengths)
+    c_avg = arr[:,0].mean()
+    m_avg = arr[:,1].mean()
+    improvement = (c_avg - m_avg) / c_avg * 100
+
+    results.append([
+        gamma, iter_gamma, smooth_fine, flow_steps, step_size,
+        c_avg, m_avg, improvement
+    ])
+
+    print(f"γ={gamma}, iter={iter_gamma}, σ={smooth_fine}, "
+          f"flow={flow_steps}, step={step_size} → {improvement:.2f}%")
+
+# Save results
+with open("mts_parameter_sweep.csv", "w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow([
+        "GAMMA", "ITER_GAMMA", "SMOOTH_FINE",
+        "FLOW_STEPS", "STEP_SIZE",
+        "Christofides", "MTS", "Improvement%"
+    ])
+    writer.writerows(results)
+
+print("\nSaved → mts_parameter_sweep.csv")
+
+# Rank best configs
+results = sorted(results, key=lambda x: x[-1], reverse=True)
+
+print("\n===== TOP 10 CONFIGURATIONS =====")
+for r in results[:10]:
+    print(f"{r[-1]:.2f}% → γ={r[0]}, iter={r[1]}, σ={r[2]}, flow={r[3]}, step={r[4]}")  Sweeping 324 configurations...
+
+γ=0.14, iter=400, σ=1.5, flow=400, step=0.8 → 6.29%
+γ=0.14, iter=400, σ=1.5, flow=400, step=1.2 → 6.14%
+γ=0.14, iter=400, σ=1.5, flow=400, step=1.6 → 4.08%
+γ=0.14, iter=400, σ=1.5, flow=600, step=0.8 → 7.61%
+γ=0.14, iter=400, σ=1.5, flow=600, step=1.2 → 5.08%
+γ=0.14, iter=400, σ=1.5, flow=600, step=1.6 → 7.14%
+γ=0.14, iter=400, σ=1.5, flow=800, step=0.8 → 5.49%
+γ=0.14, iter=400, σ=1.5, flow=800, step=1.2 → 4.73%
+γ=0.14, iter=400, σ=1.5, flow=800, step=1.6 → 5.85%
+γ=0.14, iter=400, σ=2.0, flow=400, step=0.8 → 6.27%
+γ=0.14, iter=400, σ=2.0, flow=400, step=1.2 → 6.35%
+γ=0.14, iter=400, σ=2.0, flow=400, step=1.6 → 3.62%
+γ=0.14, iter=400, σ=2.0, flow=600, step=0.8 → 6.28%
+γ=0.14, iter=400, σ=2.0, flow=600, step=1.2 → 5.69%
+γ=0.14, iter=400, σ=2.0, flow=600, step=1.6 → 7.26%
+γ=0.14, iter=400, σ=2.0, flow=800, step=0.8 → 5.33%
+γ=0.14, iter=400, σ=2.0, flow=800, step=1.2 → 4.61%
+γ=0.14, iter=400, σ=2.0, flow=800, step=1.6 → 2.95%
+γ=0.14, iter=400, σ=2.5, flow=400, step=0.8 → 4.62%
+γ=0.14, iter=400, σ=2.5, flow=400, step=1.2 → 5.63%
+γ=0.14, iter=400, σ=2.5, flow=400, step=1.6 → 5.74%
+γ=0.14, iter=400, σ=2.5, flow=600, step=0.8 → 4.98%
+γ=0.14, iter=400, σ=2.5, flow=600, step=1.2 → 4.21%
+γ=0.14, iter=400, σ=2.5, flow=600, step=1.6 → 4.52%
+γ=0.14, iter=400, σ=2.5, flow=800, step=0.8 → 7.01%
+γ=0.14, iter=400, σ=2.5, flow=800, step=1.2 → 5.17%
+γ=0.14, iter=400, σ=2.5, flow=800, step=1.6 → 3.98%
+γ=0.14, iter=600, σ=1.5, flow=400, step=0.8 → 5.30%
+γ=0.14, iter=600, σ=1.5, flow=400, step=1.2 → 5.69%
+γ=0.14, iter=600, σ=1.5, flow=400, step=1.6 → 5.76%
+γ=0.14, iter=600, σ=1.5, flow=600, step=0.8 → 3.53%
+γ=0.14, iter=600, σ=1.5, flow=600, step=1.2 → 5.72%
+γ=0.14, iter=600, σ=1.5, flow=600, step=1.6 → 7.59%
+γ=0.14, iter=600, σ=1.5, flow=800, step=0.8 → 6.51%
+γ=0.14, iter=600, σ=1.5, flow=800, step=1.2 → 6.33%
+γ=0.14, iter=600, σ=1.5, flow=800, step=1.6 → 8.90%
+γ=0.14, iter=600, σ=2.0, flow=400, step=0.8 → 6.21%
+γ=0.14, iter=600, σ=2.0, flow=400, step=1.2 → 5.51%
+γ=0.14, iter=600, σ=2.0, flow=400, step=1.6 → 5.49%
+γ=0.14, iter=600, σ=2.0, flow=600, step=0.8 → 7.35%
+γ=0.14, iter=600, σ=2.0, flow=600, step=1.2 → 5.03%
+γ=0.14, iter=600, σ=2.0, flow=600, step=1.6 → 6.61%
+γ=0.14, iter=600, σ=2.0, flow=800, step=0.8 → 5.98%
+γ=0.14, iter=600, σ=2.0, flow=800, step=1.2 → 3.16%
+γ=0.14, iter=600, σ=2.0, flow=800, step=1.6 → 5.11%
+γ=0.14, iter=600, σ=2.5, flow=400, step=0.8 → 5.68%
+γ=0.14, iter=600, σ=2.5, flow=400, step=1.2 → 5.96%
+γ=0.14, iter=600, σ=2.5, flow=400, step=1.6 → 5.28%
+γ=0.14, iter=600, σ=2.5, flow=600, step=0.8 → 6.39%
+γ=0.14, iter=600, σ=2.5, flow=600, step=1.2 → 5.37%
+γ=0.14, iter=600, σ=2.5, flow=600, step=1.6 → 6.22%
+γ=0.14, iter=600, σ=2.5, flow=800, step=0.8 → 8.18%
+γ=0.14, iter=600, σ=2.5, flow=800, step=1.2 → 6.41%
+γ=0.14, iter=600, σ=2.5, flow=800, step=1.6 → 4.44%
+γ=0.14, iter=800, σ=1.5, flow=400, step=0.8 → 4.80%
+γ=0.14, iter=800, σ=1.5, flow=400, step=1.2 → 5.14%
+γ=0.14, iter=800, σ=1.5, flow=400, step=1.6 → 5.72%
+γ=0.14, iter=800, σ=1.5, flow=600, step=0.8 → 4.54%
+γ=0.14, iter=800, σ=1.5, flow=600, step=1.2 → 5.70%
+γ=0.14, iter=800, σ=1.5, flow=600, step=1.6 → 6.65%
+γ=0.14, iter=800, σ=1.5, flow=800, step=0.8 → 4.56%
+γ=0.14, iter=800, σ=1.5, flow=800, step=1.2 → 7.92%
+γ=0.14, iter=800, σ=1.5, flow=800, step=1.6 → 3.56%
+γ=0.14, iter=800, σ=2.0, flow=400, step=0.8 → 5.35%
+γ=0.14, iter=800, σ=2.0, flow=400, step=1.2 → 4.35%
+γ=0.14, iter=800, σ=2.0, flow=400, step=1.6 → 4.61%
+γ=0.14, iter=800, σ=2.0, flow=600, step=0.8 → 5.22%
+γ=0.14, iter=800, σ=2.0, flow=600, step=1.2 → 5.31%
+γ=0.14, iter=800, σ=2.0, flow=600, step=1.6 → 3.75%
+γ=0.14, iter=800, σ=2.0, flow=800, step=0.8 → 5.52%
+γ=0.14, iter=800, σ=2.0, flow=800, step=1.2 → 5.34%
+γ=0.14, iter=800, σ=2.0, flow=800, step=1.6 → 5.73%
+γ=0.14, iter=800, σ=2.5, flow=400, step=0.8 → 6.33%
+γ=0.14, iter=800, σ=2.5, flow=400, step=1.2 → 7.16%
+γ=0.14, iter=800, σ=2.5, flow=400, step=1.6 → 4.99%
+γ=0.14, iter=800, σ=2.5, flow=600, step=0.8 → 6.33%
+γ=0.14, iter=800, σ=2.5, flow=600, step=1.2 → 6.79%
+γ=0.14, iter=800, σ=2.5, flow=600, step=1.6 → 6.48%
+γ=0.14, iter=800, σ=2.5, flow=800, step=0.8 → 8.05%
+γ=0.14, iter=800, σ=2.5, flow=800, step=1.2 → 7.99%
+γ=0.14, iter=800, σ=2.5, flow=800, step=1.6 → 4.16%
+γ=0.16, iter=400, σ=1.5, flow=400, step=0.8 → 8.38%
+γ=0.16, iter=400, σ=1.5, flow=400, step=1.2 → 8.47%
+γ=0.16, iter=400, σ=1.5, flow=400, step=1.6 → 5.67%
+γ=0.16, iter=400, σ=1.5, flow=600, step=0.8 → 3.95%
+γ=0.16, iter=400, σ=1.5, flow=600, step=1.2 → 6.36%
+γ=0.16, iter=400, σ=1.5, flow=600, step=1.6 → 6.82%
+γ=0.16, iter=400, σ=1.5, flow=800, step=0.8 → 3.86%
+γ=0.16, iter=400, σ=1.5, flow=800, step=1.2 → 5.67%
+γ=0.16, iter=400, σ=1.5, flow=800, step=1.6 → 6.02%
+γ=0.16, iter=400, σ=2.0, flow=400, step=0.8 → 8.37%
+γ=0.16, iter=400, σ=2.0, flow=400, step=1.2 → 4.16%
+γ=0.16, iter=400, σ=2.0, flow=400, step=1.6 → 6.07%
+γ=0.16, iter=400, σ=2.0, flow=600, step=0.8 → 5.11%
+γ=0.16, iter=400, σ=2.0, flow=600, step=1.2 → 4.16%
+γ=0.16, iter=400, σ=2.0, flow=600, step=1.6 → 5.78%
+γ=0.16, iter=400, σ=2.0, flow=800, step=0.8 → 5.82%
+γ=0.16, iter=400, σ=2.0, flow=800, step=1.2 → 6.23%
+γ=0.16, iter=400, σ=2.0, flow=800, step=1.6 → 6.26%
+γ=0.16, iter=400, σ=2.5, flow=400, step=0.8 → 3.67% 
