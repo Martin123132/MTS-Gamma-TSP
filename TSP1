@@ -1,0 +1,221 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter
+import networkx as nx
+from networkx.algorithms import approximation as approx
+import csv
+import math
+
+# ================================================================
+# CONFIG
+# ================================================================
+GRID = 512
+ITER_GAMMA = 600
+GAMMA = 0.18
+SMOOTH = 1.5
+FLOW_STEPS = 800
+STEP_SIZE = 1.2
+
+TEST_SIZES = [50, 75, 100]
+N_TRIALS = 20
+
+
+# ================================================================
+# EUCLIDEAN METRIC
+# ================================================================
+def euclid(a, b):
+    return np.linalg.norm(a - b)
+
+def tour_length(order, coords):
+    return sum(np.linalg.norm(coords[order[i]] - coords[order[i+1]])
+               for i in range(len(order)-1))
+
+
+# ================================================================
+# SAFE 3-OPT (LINEAR TOUR, NO CYCLIC BUGS)
+# ================================================================
+def three_opt(route, coords):
+    n = len(route)
+
+    def seg_len(a, b):
+        return np.linalg.norm(coords[route[a]] - coords[route[b]])
+
+    improved = True
+    while improved:
+        improved = False
+
+        for i in range(0, n - 3):
+            for j in range(i + 2, n - 2):
+                for k in range(j + 2, n - 1):
+
+                    old_cost = (
+                        seg_len(i, i+1) +
+                        seg_len(j, j+1) +
+                        seg_len(k, k+1)
+                    )
+
+                    # Option 1: reverse segment i+1..j
+                    r1 = route.copy()
+                    r1[i+1:j+1] = reversed(r1[i+1:j+1])
+                    c1 = (
+                        np.linalg.norm(coords[r1[i]] - coords[r1[i+1]]) +
+                        np.linalg.norm(coords[r1[j]] - coords[r1[j+1]]) +
+                        np.linalg.norm(coords[r1[k]] - coords[r1[k+1]])
+                    )
+
+                    # Option 2: reverse j+1..k
+                    r2 = route.copy()
+                    r2[j+1:k+1] = reversed(r2[j+1:k+1])
+                    c2 = (
+                        np.linalg.norm(coords[r2[i]] - coords[r2[i+1]]) +
+                        np.linalg.norm(coords[r2[j]] - coords[r2[j+1]]) +
+                        np.linalg.norm(coords[r2[k]] - coords[r2[k+1]])
+                    )
+
+                    # Option 3: reverse both segments
+                    r3 = route.copy()
+                    r3[i+1:j+1] = reversed(r3[i+1:j+1])
+                    r3[j+1:k+1] = reversed(r3[j+1:k+1])
+                    c3 = (
+                        np.linalg.norm(coords[r3[i]] - coords[r3[i+1]]) +
+                        np.linalg.norm(coords[r3[j]] - coords[r3[j+1]]) +
+                        np.linalg.norm(coords[r3[k]] - coords[r3[k+1]])
+                    )
+
+                    best = min(c1, c2, c3)
+
+                    if best < old_cost - 1e-12:
+                        if best == c1:
+                            route = r1
+                        elif best == c2:
+                            route = r2
+                        else:
+                            route = r3
+                        improved = True
+    return route
+
+
+# ================================================================
+# BUILD MTS–Γ FIELD (MBT-5 curvature diffusion)
+# ================================================================
+def build_field(coords):
+    F = np.zeros((GRID, GRID))
+
+    for x, y in coords:
+        F[int(y), int(x)] += 1.0
+
+    F = gaussian_filter(F, SMOOTH)
+
+    # Γ-diffusion
+    for _ in range(ITER_GAMMA):
+        lap = (
+            np.roll(F,1,0)+np.roll(F,-1,0)+np.roll(F,1,1)+np.roll(F,-1,1)
+            - 4*F
+        )
+        F += GAMMA * lap
+        F = np.clip(F, 0, None)
+
+    return gaussian_filter(F, 1.0)
+
+
+# ================================================================
+# GRADIENT FLOW ORDERING (WITH FULL CLAMP FIX)
+# ================================================================
+def gradient_flow_ordering(F, coords):
+
+    grad_y, grad_x = np.gradient(F)
+    flow_val = np.zeros(len(coords))
+
+    for i in range(len(coords)):
+        x, y = coords[i]
+
+        # clamp start
+        x = float(np.clip(x, 1, GRID-2))
+        y = float(np.clip(y, 1, GRID-2))
+
+        for _ in range(FLOW_STEPS):
+
+            xi = int(x)
+            yi = int(y)
+
+            gx = grad_x[yi, xi]
+            gy = grad_y[yi, xi]
+            mag = math.hypot(gx, gy)
+
+            if mag < 1e-9:
+                break
+
+            x += STEP_SIZE * gx / mag
+            y += STEP_SIZE * gy / mag
+
+            # *** CRITICAL: CLAMP AFTER UPDATE ***
+            x = float(np.clip(x, 1, GRID-2))
+            y = float(np.clip(y, 1, GRID-2))
+
+        flow_val[i] = F[int(y), int(x)]
+
+    return np.argsort(-flow_val)
+
+
+# ================================================================
+# FULL MTS SOLVER
+# ================================================================
+def mts_solver(coords):
+    F = build_field(coords)
+    order = list(gradient_flow_ordering(F, coords))
+    order = three_opt(order, coords)
+    return order, tour_length(order, coords)
+
+
+# ================================================================
+# BENCHMARK
+# ================================================================
+results = []
+
+for N in TEST_SIZES:
+    print(f"\n===== Testing N = {N} =====")
+    Nres = []
+
+    for t in range(N_TRIALS):
+        print(f"Trial {t+1}/{N_TRIALS}")
+
+        coords = np.random.rand(N,2) * (GRID-4)
+
+        G = nx.Graph()
+        for i in range(N):
+            for j in range(i+1, N):
+                G.add_edge(i, j, weight=float(euclid(coords[i], coords[j])))
+
+        # Christofides
+        c_route = approx.christofides(G)
+        c_len = tour_length(c_route, coords)
+
+        # 2020
+        a_route = approx.traveling_salesman_problem(G, cycle=True)
+        a_len = tour_length(a_route, coords)
+
+        # MTS–Γ
+        mts_route, mts_len = mts_solver(coords)
+
+        Nres.append([c_len, a_len, mts_len])
+
+    arr = np.array(Nres)
+    c_avg = arr[:,0].mean()
+    a_avg = arr[:,1].mean()
+    m_avg = arr[:,2].mean()
+
+    print("\n=== RESULTS ===")
+    print(f"Christofides: {c_avg:.2f}")
+    print(f"2020 alg:    {a_avg:.2f}")
+    print(f"MTS–Γ:       {m_avg:.2f}")
+    print(f"Improvement vs C: {(c_avg-m_avg)/c_avg*100:.2f}%")
+    print(f"Improvement vs 20: {(a_avg-m_avg)/a_avg*100:.2f}%")
+
+    results.append([N, c_avg, a_avg, m_avg])
+
+with open("mts_gamma_results.csv", "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["N","Christofides","2020","MTS_GAMMA"])
+    w.writerows(results)
+
+print("\nSaved → mts_gamma_results.csv")
