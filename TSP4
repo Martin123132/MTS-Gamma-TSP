@@ -1,0 +1,538 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter
+import networkx as nx
+from networkx.algorithms import approximation as approx
+import math
+
+# ================================================================
+# CONFIG — original winning settings
+# ================================================================
+GRID = 512
+
+SMOOTH_FINE = 2.0
+ITER_GAMMA = 600
+GAMMA = 0.18
+
+FLOW_STEPS = 800
+STEP_SIZE = 1.2
+
+N = 100
+N_TRIALS = 5
+
+
+# ================================================================
+# BASIC HELPERS
+# ================================================================
+def euclid(a, b):
+    return np.linalg.norm(a - b)
+
+def tour_length(order, coords):
+    return sum(
+        np.linalg.norm(coords[order[i]] - coords[order[i+1]])
+        for i in range(len(order)-1)
+    )
+
+
+# ================================================================
+# 2.5-OPT: reverse segments + relocate single nodes
+# ================================================================
+def two_point_five_opt(route, coords):
+    improved = True
+    n = len(route)
+
+    while improved:
+        improved = False
+
+        for i in range(1, n-2):
+            for j in range(i+2, n-1):
+
+                A, B = route[i-1], route[i]
+                C, D = route[j], route[j+1]
+
+                old = (euclid(coords[A], coords[B]) +
+                       euclid(coords[C], coords[D]))
+
+                new = (euclid(coords[A], coords[C]) +
+                       euclid(coords[B], coords[D]))
+
+                if new < old:
+                    route[i:j+1] = reversed(route[i:j+1])
+                    improved = True
+                    continue
+
+                # Relocate B between C and D
+                new_route = route.copy()
+                node = new_route.pop(i)
+                new_route.insert(j, node)
+
+                if tour_length(new_route, coords) < tour_length(route, coords):
+                    route = new_route
+                    improved = True
+                    continue
+
+    return route
+
+
+# ================================================================
+# SAFE 3-OPT (same as before)
+# ================================================================
+def three_opt(route, coords):
+    n = len(route)
+
+    def seg_len(a, b):
+        return np.linalg.norm(coords[route[a]] - coords[route[b]])
+
+    improved = True
+    while improved:
+        improved = False
+
+        for i in range(0, n - 3):
+            for j in range(i + 2, n - 2):
+                for k in range(j + 2, n - 1):
+
+                    old_cost = (
+                        seg_len(i, i+1) +
+                        seg_len(j, j+1) +
+                        seg_len(k, k+1)
+                    )
+
+                    r1 = route.copy()
+                    r1[i+1:j+1] = reversed(r1[i+1:j+1])
+                    c1 = (np.linalg.norm(coords[r1[i]] - coords[r1[i+1]]) +
+                          np.linalg.norm(coords[r1[j]] - coords[r1[j+1]]) +
+                          np.linalg.norm(coords[r1[k]] - coords[r1[k+1]]))
+
+                    r2 = route.copy()
+                    r2[j+1:k+1] = reversed(r2[j+1:k+1])
+                    c2 = (np.linalg.norm(coords[r2[i]] - coords[r2[i+1]]) +
+                          np.linalg.norm(coords[r2[j]] - coords[r2[j+1]]) +
+                          np.linalg.norm(coords[r2[k]] - coords[r2[k+1]]))
+
+                    r3 = route.copy()
+                    r3[i+1:j+1] = reversed(r3[i+1:j+1])
+                    r3[j+1:k+1] = reversed(r3[j+1:k+1])
+                    c3 = (np.linalg.norm(coords[r3[i]] - coords[r3[i+1]]) +
+                          np.linalg.norm(coords[r3[j]] - coords[r3[j+1]]) +
+                          np.linalg.norm(coords[r3[k]] - coords[r3[k+1]]))
+
+                    best = min(c1, c2, c3)
+                    if best < old_cost - 1e-12:
+                        if best == c1:
+                            route = r1
+                        elif best == c2:
+                            route = r2
+                        else:
+                            route = r3
+                        improved = True
+
+    return route
+
+
+# ================================================================
+# AGGRESSIVE HYBRID REFINEMENT (C3)
+# Repeat until convergence
+# ================================================================
+def full_refinement(route, coords):
+    improved = True
+    last_length = tour_length(route, coords)
+
+    while improved:
+        improved = False
+
+        # Apply 2.5-opt
+        route = two_point_five_opt(route, coords)
+
+        # Apply 3-opt
+        route = three_opt(route, coords)
+
+        # One more 2.5-opt sweep
+        route = two_point_five_opt(route, coords)
+
+        new_length = tour_length(route, coords)
+
+        if new_length < last_length - 1e-9:
+            improved = True
+            last_length = new_length
+
+    return route
+
+
+# ================================================================
+# CURVATURE FIELD — your original winning version
+# ================================================================
+def build_field(coords):
+    F = np.zeros((GRID, GRID))
+
+    for x, y in coords:
+        F[int(y), int(x)] += 1.0
+
+    F = gaussian_filter(F, SMOOTH_FINE)
+
+    for _ in range(ITER_GAMMA):
+        lap = (
+            np.roll(F,1,0)+np.roll(F,-1,0)+np.roll(F,1,1)+np.roll(F,-1,1)
+            - 4*F
+        )
+        F += GAMMA * lap
+        F[F < 0] = 0
+
+    return gaussian_filter(F, 1.0)
+
+
+# ================================================================
+# ORIGINAL GRADIENT FLOW — untouched (this is the magic)
+# ================================================================
+def gradient_flow_ordering(F, coords):
+
+    grad_y, grad_x = np.gradient(F)
+    flow_val = np.zeros(len(coords))
+
+    for i in range(len(coords)):
+        x, y = coords[i]
+        x = float(np.clip(x, 1, GRID-2))
+        y = float(np.clip(y, 1, GRID-2))
+
+        for _ in range(FLOW_STEPS):
+
+            xi = int(x)
+            yi = int(y)
+
+            gx = grad_x[yi, xi]
+            gy = grad_y[yi, xi]
+
+            mag = math.hypot(gx, gy)
+            if mag < 1e-9:
+                break
+
+            x += STEP_SIZE * gx / mag
+            y += STEP_SIZE * gy / mag
+
+            x = float(np.clip(x, 1, GRID-2))
+            y = float(np.clip(y, 1, GRID-2))
+
+        flow_val[i] = F[int(y), int(x)]
+
+    return np.argsort(-flow_val)
+
+
+# ================================================================
+# FULL SOLVER
+# ================================================================
+def mts_solver(coords):
+    F = build_field(coords)
+    order = list(gradient_flow_ordering(F, coords))
+    order = full_refinement(order, coords)
+    return order, tour_length(order, coords)
+
+
+# ================================================================
+# BENCHMARK
+# ================================================================
+print("\n===== MTS–Γ + FULL Hybrid (C3) vs Christofides (5 trials, N=100) =====")
+
+results = []
+
+for t in range(N_TRIALS):
+    print(f"Trial {t+1}/{N_TRIALS}")
+
+    coords = np.random.rand(N,2) * (GRID-4)
+
+    G = nx.Graph()
+    for i in range(N):
+        for j in range(i+1, N):
+            G.add_edge(i, j, weight=float(euclid(coords[i], coords[j])))
+
+    c_route = approx.christofides(G)
+    c_len = tour_length(c_route, coords)
+
+    mts_route, mts_len = mts_solver(coords)
+
+    results.append([c_len, mts_len])
+
+arr = np.array(results)
+
+c_avg = arr[:,0].mean()
+m_avg = arr[:,1].mean()
+
+print("\n=== RESULTS ===")
+print(f"Christofides: {c_avg:.2f}")
+print(f"MTS–Γ C3:     {m_avg:.2f}")
+print(f"Improvement:  {(c_avg-m_avg)/c_avg*100:.2f}%")
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter
+import networkx as nx
+from networkx.algorithms import approximation as approx
+import math
+
+# ================================================================
+# CONFIG — original winning settings
+# ================================================================
+GRID = 512
+
+SMOOTH_FINE = 2.0
+ITER_GAMMA = 600
+GAMMA = 0.18
+
+FLOW_STEPS = 800
+STEP_SIZE = 1.2
+
+N = 100
+N_TRIALS = 5
+
+
+# ================================================================
+# BASIC HELPERS
+# ================================================================
+def euclid(a, b):
+    return np.linalg.norm(a - b)
+
+def tour_length(order, coords):
+    return sum(
+        np.linalg.norm(coords[order[i]] - coords[order[i+1]])
+        for i in range(len(order)-1)
+    )
+
+
+# ================================================================
+# 2.5-OPT: reverse segments + relocate single nodes
+# ================================================================
+def two_point_five_opt(route, coords):
+    improved = True
+    n = len(route)
+
+    while improved:
+        improved = False
+
+        for i in range(1, n-2):
+            for j in range(i+2, n-1):
+
+                A, B = route[i-1], route[i]
+                C, D = route[j], route[j+1]
+
+                old = (euclid(coords[A], coords[B]) +
+                       euclid(coords[C], coords[D]))
+
+                new = (euclid(coords[A], coords[C]) +
+                       euclid(coords[B], coords[D]))
+
+                if new < old:
+                    route[i:j+1] = reversed(route[i:j+1])
+                    improved = True
+                    continue
+
+                # Relocate B between C and D
+                new_route = route.copy()
+                node = new_route.pop(i)
+                new_route.insert(j, node)
+
+                if tour_length(new_route, coords) < tour_length(route, coords):
+                    route = new_route
+                    improved = True
+                    continue
+
+    return route
+
+
+# ================================================================
+# SAFE 3-OPT (same as before)
+# ================================================================
+def three_opt(route, coords):
+    n = len(route)
+
+    def seg_len(a, b):
+        return np.linalg.norm(coords[route[a]] - coords[route[b]])
+
+    improved = True
+    while improved:
+        improved = False
+
+        for i in range(0, n - 3):
+            for j in range(i + 2, n - 2):
+                for k in range(j + 2, n - 1):
+
+                    old_cost = (
+                        seg_len(i, i+1) +
+                        seg_len(j, j+1) +
+                        seg_len(k, k+1)
+                    )
+
+                    r1 = route.copy()
+                    r1[i+1:j+1] = reversed(r1[i+1:j+1])
+                    c1 = (np.linalg.norm(coords[r1[i]] - coords[r1[i+1]]) +
+                          np.linalg.norm(coords[r1[j]] - coords[r1[j+1]]) +
+                          np.linalg.norm(coords[r1[k]] - coords[r1[k+1]]))
+
+                    r2 = route.copy()
+                    r2[j+1:k+1] = reversed(r2[j+1:k+1])
+                    c2 = (np.linalg.norm(coords[r2[i]] - coords[r2[i+1]]) +
+                          np.linalg.norm(coords[r2[j]] - coords[r2[j+1]]) +
+                          np.linalg.norm(coords[r2[k]] - coords[r2[k+1]]))
+
+                    r3 = route.copy()
+                    r3[i+1:j+1] = reversed(r3[i+1:j+1])
+                    r3[j+1:k+1] = reversed(r3[j+1:k+1])
+                    c3 = (np.linalg.norm(coords[r3[i]] - coords[r3[i+1]]) +
+                          np.linalg.norm(coords[r3[j]] - coords[r3[j+1]]) +
+                          np.linalg.norm(coords[r3[k]] - coords[r3[k+1]]))
+
+                    best = min(c1, c2, c3)
+                    if best < old_cost - 1e-12:
+                        if best == c1:
+                            route = r1
+                        elif best == c2:
+                            route = r2
+                        else:
+                            route = r3
+                        improved = True
+
+    return route
+
+
+# ================================================================
+# AGGRESSIVE HYBRID REFINEMENT (C3)
+# Repeat until convergence
+# ================================================================
+def full_refinement(route, coords):
+    improved = True
+    last_length = tour_length(route, coords)
+
+    while improved:
+        improved = False
+
+        # Apply 2.5-opt
+        route = two_point_five_opt(route, coords)
+
+        # Apply 3-opt
+        route = three_opt(route, coords)
+
+        # One more 2.5-opt sweep
+        route = two_point_five_opt(route, coords)
+
+        new_length = tour_length(route, coords)
+
+        if new_length < last_length - 1e-9:
+            improved = True
+            last_length = new_length
+
+    return route
+
+
+# ================================================================
+# CURVATURE FIELD — your original winning version
+# ================================================================
+def build_field(coords):
+    F = np.zeros((GRID, GRID))
+
+    for x, y in coords:
+        F[int(y), int(x)] += 1.0
+
+    F = gaussian_filter(F, SMOOTH_FINE)
+
+    for _ in range(ITER_GAMMA):
+        lap = (
+            np.roll(F,1,0)+np.roll(F,-1,0)+np.roll(F,1,1)+np.roll(F,-1,1)
+            - 4*F
+        )
+        F += GAMMA * lap
+        F[F < 0] = 0
+
+    return gaussian_filter(F, 1.0)
+
+
+# ================================================================
+# ORIGINAL GRADIENT FLOW — untouched (this is the magic)
+# ================================================================
+def gradient_flow_ordering(F, coords):
+
+    grad_y, grad_x = np.gradient(F)
+    flow_val = np.zeros(len(coords))
+
+    for i in range(len(coords)):
+        x, y = coords[i]
+        x = float(np.clip(x, 1, GRID-2))
+        y = float(np.clip(y, 1, GRID-2))
+
+        for _ in range(FLOW_STEPS):
+
+            xi = int(x)
+            yi = int(y)
+
+            gx = grad_x[yi, xi]
+            gy = grad_y[yi, xi]
+
+            mag = math.hypot(gx, gy)
+            if mag < 1e-9:
+                break
+
+            x += STEP_SIZE * gx / mag
+            y += STEP_SIZE * gy / mag
+
+            x = float(np.clip(x, 1, GRID-2))
+            y = float(np.clip(y, 1, GRID-2))
+
+        flow_val[i] = F[int(y), int(x)]
+
+    return np.argsort(-flow_val)
+
+
+# ================================================================
+# FULL SOLVER
+# ================================================================
+def mts_solver(coords):
+    F = build_field(coords)
+    order = list(gradient_flow_ordering(F, coords))
+    order = full_refinement(order, coords)
+    return order, tour_length(order, coords)
+
+
+# ================================================================
+# BENCHMARK
+# ================================================================
+print("\n===== MTS–Γ + FULL Hybrid (C3) vs Christofides (5 trials, N=100) =====")
+
+results = []
+
+for t in range(N_TRIALS):
+    print(f"Trial {t+1}/{N_TRIALS}")
+
+    coords = np.random.rand(N,2) * (GRID-4)
+
+    G = nx.Graph()
+    for i in range(N):
+        for j in range(i+1, N):
+            G.add_edge(i, j, weight=float(euclid(coords[i], coords[j])))
+
+    c_route = approx.christofides(G)
+    c_len = tour_length(c_route, coords)
+
+    mts_route, mts_len = mts_solver(coords)
+
+    results.append([c_len, mts_len])
+
+arr = np.array(results)
+
+c_avg = arr[:,0].mean()
+m_avg = arr[:,1].mean()
+
+print("\n=== RESULTS ===")
+print(f"Christofides: {c_avg:.2f}")
+print(f"MTS–Γ C3:     {m_avg:.2f}")
+print(f"Improvement:  {(c_avg-m_avg)/c_avg*100:.2f}%")
+
+
+
+===== MTS–Γ + FULL Hybrid (C3) vs Christofides (5 trials, N=100) =====
+Trial 1/5
+Trial 2/5
+Trial 3/5
+Trial 4/5
+Trial 5/5
+
+=== RESULTS ===
+Christofides: 4494.74
+MTS–Γ C3:     4163.90
+Improvement:  7.36%
