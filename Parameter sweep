@@ -1,0 +1,627 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter
+import networkx as nx
+from networkx.algorithms import approximation as approx
+import math
+import itertools
+import csv
+
+# ================================================================
+# BASE CONFIG
+# ================================================================
+GRID = 512
+N = 100
+N_TRIALS = 5
+
+# Search ranges to sweep
+GAMMA_LIST = [0.14, 0.16, 0.18, 0.20]
+ITER_GAMMA_LIST = [400, 600, 800]
+FLOW_STEPS_LIST = [400, 600, 800]
+STEP_SIZE_LIST = [0.8, 1.2, 1.6]
+SMOOTH_FINE_LIST = [1.5, 2.0, 2.5]
+
+
+# ================================================================
+# BASIC HELPERS
+# ================================================================
+def euclid(a, b):
+    return np.linalg.norm(a - b)
+
+def tour_length(order, coords):
+    return sum(
+        np.linalg.norm(coords[order[i]] - coords[order[i+1]])
+        for i in range(len(order)-1)
+    )
+
+
+# ================================================================
+# 2.5-OPT
+# ================================================================
+def two_point_five_opt(route, coords):
+    improved = True
+    n = len(route)
+
+    while improved:
+        improved = False
+        for i in range(1, n-2):
+            for j in range(i+2, n-1):
+
+                A, B = route[i-1], route[i]
+                C, D = route[j], route[j+1]
+
+                old = (euclid(coords[A], coords[B]) +
+                       euclid(coords[C], coords[D]))
+
+                new = (euclid(coords[A], coords[C]) +
+                       euclid(coords[B], coords[D]))
+
+                if new < old:
+                    route[i:j+1] = reversed(route[i:j+1])
+                    improved = True
+                    continue
+
+                new_route = route.copy()
+                node = new_route.pop(i)
+                new_route.insert(j, node)
+
+                if tour_length(new_route, coords) < tour_length(route, coords):
+                    route = new_route
+                    improved = True
+                    continue
+
+    return route
+
+
+# ================================================================
+# SAFE 3-OPT
+# ================================================================
+def three_opt(route, coords):
+    n = len(route)
+
+    def seg_len(a, b):
+        return np.linalg.norm(coords[route[a]] - coords[route[b]])
+
+    improved = True
+    while improved:
+        improved = False
+
+        for i in range(0, n - 3):
+            for j in range(i + 2, n - 2):
+                for k in range(j + 2, n - 1):
+
+                    old_cost = (
+                        seg_len(i, i+1) +
+                        seg_len(j, j+1) +
+                        seg_len(k, k+1)
+                    )
+
+                    r1 = route.copy()
+                    r1[i+1:j+1] = reversed(r1[i+1:j+1])
+                    c1 = (np.linalg.norm(coords[r1[i]] - coords[r1[i+1]]) +
+                          np.linalg.norm(coords[r1[j]] - coords[r1[j+1]]) +
+                          np.linalg.norm(coords[r1[k]] - coords[r1[k+1]]))
+
+                    r2 = route.copy()
+                    r2[j+1:k+1] = reversed(r2[j+1:k+1])
+                    c2 = (np.linalg.norm(coords[r2[i]] - coords[r2[i+1]]) +
+                          np.linalg.norm(coords[r2[j]] - coords[r2[j+1]]) +
+                          np.linalg.norm(coords[r2[k]] - coords[r2[k+1]]))
+
+                    r3 = route.copy()
+                    r3[i+1:j+1] = reversed(r3[i+1:j+1])
+                    r3[j+1:k+1] = reversed(r3[j+1:k+1])
+                    c3 = (np.linalg.norm(coords[r3[i]] - coords[r3[i+1]]) +
+                          np.linalg.norm(coords[r3[j]] - coords[r3[j+1]]) +
+                          np.linalg.norm(coords[r3[k]] - coords[r3[k+1]]))
+
+                    best = min(c1, c2, c3)
+                    if best < old_cost - 1e-12:
+                        if best == c1:
+                            route = r1
+                        elif best == c2:
+                            route = r2
+                        else:
+                            route = r3
+                        improved = True
+
+    return route
+
+
+# ================================================================
+# FULL HYBRID REFINEMENT (C3)
+# ================================================================
+def full_refinement(route, coords):
+    improved = True
+    last_length = tour_length(route, coords)
+
+    while improved:
+        improved = False
+        route = two_point_five_opt(route, coords)
+        route = three_opt(route, coords)
+        route = two_point_five_opt(route, coords)
+
+        new_length = tour_length(route, coords)
+        if new_length < last_length - 1e-9:
+            improved = True
+            last_length = new_length
+
+    return route
+
+
+# ================================================================
+# CURVATURE FIELD
+# ================================================================
+def build_field(coords, gamma, iter_gamma, smooth_fine):
+    F = np.zeros((GRID, GRID))
+
+    for x, y in coords:
+        F[int(y), int(x)] += 1.0
+
+    F = gaussian_filter(F, smooth_fine)
+
+    for _ in range(iter_gamma):
+        lap = (
+            np.roll(F,1,0)+np.roll(F,-1,0)+np.roll(F,1,1)+np.roll(F,-1,1)
+            - 4*F
+        )
+        F += gamma * lap
+        F[F < 0] = 0
+
+    return gaussian_filter(F, 1.0)
+
+
+# ================================================================
+# GRADIENT FLOW ORDERING
+# ================================================================
+def gradient_flow_ordering(F, coords, flow_steps, step_size):
+
+    grad_y, grad_x = np.gradient(F)
+    flow_val = np.zeros(len(coords))
+
+    for i in range(len(coords)):
+        x, y = coords[i]
+        x = float(np.clip(x, 1, GRID-2))
+        y = float(np.clip(y, 1, GRID-2))
+
+        for _ in range(flow_steps):
+
+            xi = int(x)
+            yi = int(y)
+
+            gx = grad_x[yi, xi]
+            gy = grad_y[yi, xi]
+
+            mag = math.hypot(gx, gy)
+            if mag < 1e-9:
+                break
+
+            x += step_size * gx / mag
+            y += step_size * gy / mag
+
+            x = float(np.clip(x, 1, GRID-2))
+            y = float(np.clip(y, 1, GRID-2))
+
+        flow_val[i] = F[int(y), int(x)]
+
+    return np.argsort(-flow_val)
+
+
+# ================================================================
+# FULL SOLVER
+# ================================================================
+def mts_solver(coords, gamma, iter_gamma, smooth_fine, flow_steps, step_size):
+
+    F = build_field(coords, gamma, iter_gamma, smooth_fine)
+    order = list(gradient_flow_ordering(F, coords, flow_steps, step_size))
+    order = full_refinement(order, coords)
+
+    return order, tour_length(order, coords)
+
+
+# ================================================================
+# RUN PARAMETER SWEEP
+# ================================================================
+results = []
+
+sweep_space = list(itertools.product(
+    GAMMA_LIST,
+    ITER_GAMMA_LIST,
+    SMOOTH_FINE_LIST,
+    FLOW_STEPS_LIST,
+    STEP_SIZE_LIST
+))
+
+print(f"\nSweeping {len(sweep_space)} configurations...\n")
+
+for (gamma, iter_gamma, smooth_fine, flow_steps, step_size) in sweep_space:
+    trial_lengths = []
+
+    for t in range(N_TRIALS):
+        coords = np.random.rand(N,2) * (GRID-4)
+
+        G = nx.Graph()
+        for i in range(N):
+            for j in range(i+1, N):
+                G.add_edge(i, j, weight=float(euclid(coords[i], coords[j])))
+
+        c_route = approx.christofides(G)
+        c_len = tour_length(c_route, coords)
+
+        mts_route, mts_len = mts_solver(
+            coords, gamma, iter_gamma, smooth_fine, flow_steps, step_size
+        )
+
+        trial_lengths.append((c_len, mts_len))
+
+    arr = np.array(trial_lengths)
+    c_avg = arr[:,0].mean()
+    m_avg = arr[:,1].mean()
+    improvement = (c_avg - m_avg) / c_avg * 100
+
+    results.append([
+        gamma, iter_gamma, smooth_fine, flow_steps, step_size,
+        c_avg, m_avg, improvement
+    ])
+
+    print(f"γ={gamma}, iter={iter_gamma}, σ={smooth_fine}, "
+          f"flow={flow_steps}, step={step_size} → {improvement:.2f}%")
+
+# Save results
+with open("mts_parameter_sweep.csv", "w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow([
+        "GAMMA", "ITER_GAMMA", "SMOOTH_FINE",
+        "FLOW_STEPS", "STEP_SIZE",
+        "Christofides", "MTS", "Improvement%"
+    ])
+    writer.writerows(results)
+
+print("\nSaved → mts_parameter_sweep.csv")
+
+# Rank best configs
+results = sorted(results, key=lambda x: x[-1], reverse=True)
+
+print("\n===== TOP 10 CONFIGURATIONS =====")
+for r in results[:10]:
+    print(f"{r[-1]:.2f}% → γ={r[0]}, iter={r[1]}, σ={r[2]}, flow={r[3]}, step={r[4]}")
+Sweeping 324 configurations...
+
+γ=0.14, iter=400, σ=1.5, flow=400, step=0.8 → 6.29%
+γ=0.14, iter=400, σ=1.5, flow=400, step=1.2 → 6.14%
+γ=0.14, iter=400, σ=1.5, flow=400, step=1.6 → 4.08%
+γ=0.14, iter=400, σ=1.5, flow=600, step=0.8 → 7.61%
+γ=0.14, iter=400, σ=1.5, flow=600, step=1.2 → 5.08%
+γ=0.14, iter=400, σ=1.5, flow=600, step=1.6 → 7.14%
+γ=0.14, iter=400, σ=1.5, flow=800, step=0.8 → 5.49%
+γ=0.14, iter=400, σ=1.5, flow=800, step=1.2 → 4.73%
+γ=0.14, iter=400, σ=1.5, flow=800, step=1.6 → 5.85%
+γ=0.14, iter=400, σ=2.0, flow=400, step=0.8 → 6.27%
+γ=0.14, iter=400, σ=2.0, flow=400, step=1.2 → 6.35%
+γ=0.14, iter=400, σ=2.0, flow=400, step=1.6 → 3.62%
+γ=0.14, iter=400, σ=2.0, flow=600, step=0.8 → 6.28%
+γ=0.14, iter=400, σ=2.0, flow=600, step=1.2 → 5.69%
+γ=0.14, iter=400, σ=2.0, flow=600, step=1.6 → 7.26%
+γ=0.14, iter=400, σ=2.0, flow=800, step=0.8 → 5.33%
+γ=0.14, iter=400, σ=2.0, flow=800, step=1.2 → 4.61%
+γ=0.14, iter=400, σ=2.0, flow=800, step=1.6 → 2.95%
+γ=0.14, iter=400, σ=2.5, flow=400, step=0.8 → 4.62%
+γ=0.14, iter=400, σ=2.5, flow=400, step=1.2 → 5.63%
+γ=0.14, iter=400, σ=2.5, flow=400, step=1.6 → 5.74%
+γ=0.14, iter=400, σ=2.5, flow=600, step=0.8 → 4.98%
+γ=0.14, iter=400, σ=2.5, flow=600, step=1.2 → 4.21%
+γ=0.14, iter=400, σ=2.5, flow=600, step=1.6 → 4.52%
+γ=0.14, iter=400, σ=2.5, flow=800, step=0.8 → 7.01%
+γ=0.14, iter=400, σ=2.5, flow=800, step=1.2 → 5.17%
+γ=0.14, iter=400, σ=2.5, flow=800, step=1.6 → 3.98%
+γ=0.14, iter=600, σ=1.5, flow=400, step=0.8 → 5.30%
+γ=0.14, iter=600, σ=1.5, flow=400, step=1.2 → 5.69%
+γ=0.14, iter=600, σ=1.5, flow=400, step=1.6 → 5.76%
+γ=0.14, iter=600, σ=1.5, flow=600, step=0.8 → 3.53%
+γ=0.14, iter=600, σ=1.5, flow=600, step=1.2 → 5.72%
+γ=0.14, iter=600, σ=1.5, flow=600, step=1.6 → 7.59%
+γ=0.14, iter=600, σ=1.5, flow=800, step=0.8 → 6.51%
+γ=0.14, iter=600, σ=1.5, flow=800, step=1.2 → 6.33%
+γ=0.14, iter=600, σ=1.5, flow=800, step=1.6 → 8.90%
+γ=0.14, iter=600, σ=2.0, flow=400, step=0.8 → 6.21%
+γ=0.14, iter=600, σ=2.0, flow=400, step=1.2 → 5.51%
+γ=0.14, iter=600, σ=2.0, flow=400, step=1.6 → 5.49%
+γ=0.14, iter=600, σ=2.0, flow=600, step=0.8 → 7.35%
+γ=0.14, iter=600, σ=2.0, flow=600, step=1.2 → 5.03%
+γ=0.14, iter=600, σ=2.0, flow=600, step=1.6 → 6.61%
+γ=0.14, iter=600, σ=2.0, flow=800, step=0.8 → 5.98%
+γ=0.14, iter=600, σ=2.0, flow=800, step=1.2 → 3.16%
+γ=0.14, iter=600, σ=2.0, flow=800, step=1.6 → 5.11%
+γ=0.14, iter=600, σ=2.5, flow=400, step=0.8 → 5.68%
+γ=0.14, iter=600, σ=2.5, flow=400, step=1.2 → 5.96%
+γ=0.14, iter=600, σ=2.5, flow=400, step=1.6 → 5.28%
+γ=0.14, iter=600, σ=2.5, flow=600, step=0.8 → 6.39%
+γ=0.14, iter=600, σ=2.5, flow=600, step=1.2 → 5.37%
+γ=0.14, iter=600, σ=2.5, flow=600, step=1.6 → 6.22%
+γ=0.14, iter=600, σ=2.5, flow=800, step=0.8 → 8.18%
+γ=0.14, iter=600, σ=2.5, flow=800, step=1.2 → 6.41%
+γ=0.14, iter=600, σ=2.5, flow=800, step=1.6 → 4.44%
+γ=0.14, iter=800, σ=1.5, flow=400, step=0.8 → 4.80%
+γ=0.14, iter=800, σ=1.5, flow=400, step=1.2 → 5.14%
+γ=0.14, iter=800, σ=1.5, flow=400, step=1.6 → 5.72%
+γ=0.14, iter=800, σ=1.5, flow=600, step=0.8 → 4.54%
+γ=0.14, iter=800, σ=1.5, flow=600, step=1.2 → 5.70%
+γ=0.14, iter=800, σ=1.5, flow=600, step=1.6 → 6.65%
+γ=0.14, iter=800, σ=1.5, flow=800, step=0.8 → 4.56%
+γ=0.14, iter=800, σ=1.5, flow=800, step=1.2 → 7.92%
+γ=0.14, iter=800, σ=1.5, flow=800, step=1.6 → 3.56%
+γ=0.14, iter=800, σ=2.0, flow=400, step=0.8 → 5.35%
+γ=0.14, iter=800, σ=2.0, flow=400, step=1.2 → 4.35%
+γ=0.14, iter=800, σ=2.0, flow=400, step=1.6 → 4.61%
+γ=0.14, iter=800, σ=2.0, flow=600, step=0.8 → 5.22%
+γ=0.14, iter=800, σ=2.0, flow=600, step=1.2 → 5.31%
+γ=0.14, iter=800, σ=2.0, flow=600, step=1.6 → 3.75%
+γ=0.14, iter=800, σ=2.0, flow=800, step=0.8 → 5.52%
+γ=0.14, iter=800, σ=2.0, flow=800, step=1.2 → 5.34%
+γ=0.14, iter=800, σ=2.0, flow=800, step=1.6 → 5.73%
+γ=0.14, iter=800, σ=2.5, flow=400, step=0.8 → 6.33%
+γ=0.14, iter=800, σ=2.5, flow=400, step=1.2 → 7.16%
+γ=0.14, iter=800, σ=2.5, flow=400, step=1.6 → 4.99%
+γ=0.14, iter=800, σ=2.5, flow=600, step=0.8 → 6.33%
+γ=0.14, iter=800, σ=2.5, flow=600, step=1.2 → 6.79%
+γ=0.14, iter=800, σ=2.5, flow=600, step=1.6 → 6.48%
+γ=0.14, iter=800, σ=2.5, flow=800, step=0.8 → 8.05%
+γ=0.14, iter=800, σ=2.5, flow=800, step=1.2 → 7.99%
+γ=0.14, iter=800, σ=2.5, flow=800, step=1.6 → 4.16%
+γ=0.16, iter=400, σ=1.5, flow=400, step=0.8 → 8.38%
+γ=0.16, iter=400, σ=1.5, flow=400, step=1.2 → 8.47%
+γ=0.16, iter=400, σ=1.5, flow=400, step=1.6 → 5.67%
+γ=0.16, iter=400, σ=1.5, flow=600, step=0.8 → 3.95%
+γ=0.16, iter=400, σ=1.5, flow=600, step=1.2 → 6.36%
+γ=0.16, iter=400, σ=1.5, flow=600, step=1.6 → 6.82%
+γ=0.16, iter=400, σ=1.5, flow=800, step=0.8 → 3.86%
+γ=0.16, iter=400, σ=1.5, flow=800, step=1.2 → 5.67%
+γ=0.16, iter=400, σ=1.5, flow=800, step=1.6 → 6.02%
+γ=0.16, iter=400, σ=2.0, flow=400, step=0.8 → 8.37%
+γ=0.16, iter=400, σ=2.0, flow=400, step=1.2 → 4.16%
+γ=0.16, iter=400, σ=2.0, flow=400, step=1.6 → 6.07%
+γ=0.16, iter=400, σ=2.0, flow=600, step=0.8 → 5.11%
+γ=0.16, iter=400, σ=2.0, flow=600, step=1.2 → 4.16%
+γ=0.16, iter=400, σ=2.0, flow=600, step=1.6 → 5.78%
+γ=0.16, iter=400, σ=2.0, flow=800, step=0.8 → 5.82%
+γ=0.16, iter=400, σ=2.0, flow=800, step=1.2 → 6.23%
+γ=0.16, iter=400, σ=2.0, flow=800, step=1.6 → 6.26%
+γ=0.16, iter=400, σ=2.5, flow=400, step=0.8 → 3.67%
+γ=0.16, iter=400, σ=2.5, flow=400, step=1.2 → 6.57%
+γ=0.16, iter=400, σ=2.5, flow=400, step=1.6 → 5.41%
+γ=0.16, iter=400, σ=2.5, flow=600, step=0.8 → 5.18%
+γ=0.16, iter=400, σ=2.5, flow=600, step=1.2 → 8.09%
+γ=0.16, iter=400, σ=2.5, flow=600, step=1.6 → 4.94%
+γ=0.16, iter=400, σ=2.5, flow=800, step=0.8 → 6.31%
+γ=0.16, iter=400, σ=2.5, flow=800, step=1.2 → 3.75%
+γ=0.16, iter=400, σ=2.5, flow=800, step=1.6 → 4.23%
+γ=0.16, iter=600, σ=1.5, flow=400, step=0.8 → 7.23%
+γ=0.16, iter=600, σ=1.5, flow=400, step=1.2 → 4.78%
+γ=0.16, iter=600, σ=1.5, flow=400, step=1.6 → 4.03%
+γ=0.16, iter=600, σ=1.5, flow=600, step=0.8 → 5.57%
+γ=0.16, iter=600, σ=1.5, flow=600, step=1.2 → 4.05%
+γ=0.16, iter=600, σ=1.5, flow=600, step=1.6 → 4.19%
+γ=0.16, iter=600, σ=1.5, flow=800, step=0.8 → 6.25%
+γ=0.16, iter=600, σ=1.5, flow=800, step=1.2 → 6.20%
+γ=0.16, iter=600, σ=1.5, flow=800, step=1.6 → 3.76%
+γ=0.16, iter=600, σ=2.0, flow=400, step=0.8 → 5.04%
+γ=0.16, iter=600, σ=2.0, flow=400, step=1.2 → 7.53%
+γ=0.16, iter=600, σ=2.0, flow=400, step=1.6 → 6.34%
+γ=0.16, iter=600, σ=2.0, flow=600, step=0.8 → 5.84%
+γ=0.16, iter=600, σ=2.0, flow=600, step=1.2 → 7.76%
+γ=0.16, iter=600, σ=2.0, flow=600, step=1.6 → 5.33%
+γ=0.16, iter=600, σ=2.0, flow=800, step=0.8 → 5.86%
+γ=0.16, iter=600, σ=2.0, flow=800, step=1.2 → 4.88%
+γ=0.16, iter=600, σ=2.0, flow=800, step=1.6 → 6.00%
+γ=0.16, iter=600, σ=2.5, flow=400, step=0.8 → 5.91%
+γ=0.16, iter=600, σ=2.5, flow=400, step=1.2 → 5.71%
+γ=0.16, iter=600, σ=2.5, flow=400, step=1.6 → 6.83%
+γ=0.16, iter=600, σ=2.5, flow=600, step=0.8 → 4.55%
+γ=0.16, iter=600, σ=2.5, flow=600, step=1.2 → 6.99%
+γ=0.16, iter=600, σ=2.5, flow=600, step=1.6 → 3.77%
+γ=0.16, iter=600, σ=2.5, flow=800, step=0.8 → 5.74%
+γ=0.16, iter=600, σ=2.5, flow=800, step=1.2 → 7.23%
+γ=0.16, iter=600, σ=2.5, flow=800, step=1.6 → 4.51%
+γ=0.16, iter=800, σ=1.5, flow=400, step=0.8 → 3.02%
+γ=0.16, iter=800, σ=1.5, flow=400, step=1.2 → 5.50%
+γ=0.16, iter=800, σ=1.5, flow=400, step=1.6 → 6.92%
+γ=0.16, iter=800, σ=1.5, flow=600, step=0.8 → 6.61%
+γ=0.16, iter=800, σ=1.5, flow=600, step=1.2 → 6.79%
+γ=0.16, iter=800, σ=1.5, flow=600, step=1.6 → 7.67%
+γ=0.16, iter=800, σ=1.5, flow=800, step=0.8 → 4.00%
+γ=0.16, iter=800, σ=1.5, flow=800, step=1.2 → 6.89%
+γ=0.16, iter=800, σ=1.5, flow=800, step=1.6 → 6.32%
+γ=0.16, iter=800, σ=2.0, flow=400, step=0.8 → 5.06%
+γ=0.16, iter=800, σ=2.0, flow=400, step=1.2 → 6.26%
+γ=0.16, iter=800, σ=2.0, flow=400, step=1.6 → 5.36%
+γ=0.16, iter=800, σ=2.0, flow=600, step=0.8 → 5.82%
+γ=0.16, iter=800, σ=2.0, flow=600, step=1.2 → 9.32%
+γ=0.16, iter=800, σ=2.0, flow=600, step=1.6 → 5.71%
+γ=0.16, iter=800, σ=2.0, flow=800, step=0.8 → 7.36%
+γ=0.16, iter=800, σ=2.0, flow=800, step=1.2 → 5.72%
+γ=0.16, iter=800, σ=2.0, flow=800, step=1.6 → 5.27%
+γ=0.16, iter=800, σ=2.5, flow=400, step=0.8 → 6.57%
+γ=0.16, iter=800, σ=2.5, flow=400, step=1.2 → 5.13%
+γ=0.16, iter=800, σ=2.5, flow=400, step=1.6 → 7.99%
+γ=0.16, iter=800, σ=2.5, flow=600, step=0.8 → 4.94%
+γ=0.16, iter=800, σ=2.5, flow=600, step=1.2 → 6.37%
+γ=0.16, iter=800, σ=2.5, flow=600, step=1.6 → 4.21%
+γ=0.16, iter=800, σ=2.5, flow=800, step=0.8 → 6.41%
+γ=0.16, iter=800, σ=2.5, flow=800, step=1.2 → 6.13%
+γ=0.16, iter=800, σ=2.5, flow=800, step=1.6 → 7.94%
+γ=0.18, iter=400, σ=1.5, flow=400, step=0.8 → 7.48%
+γ=0.18, iter=400, σ=1.5, flow=400, step=1.2 → 5.59%
+γ=0.18, iter=400, σ=1.5, flow=400, step=1.6 → 5.63%
+γ=0.18, iter=400, σ=1.5, flow=600, step=0.8 → 6.75%
+γ=0.18, iter=400, σ=1.5, flow=600, step=1.2 → 6.16%
+γ=0.18, iter=400, σ=1.5, flow=600, step=1.6 → 6.29%
+γ=0.18, iter=400, σ=1.5, flow=800, step=0.8 → 6.97%
+γ=0.18, iter=400, σ=1.5, flow=800, step=1.2 → 6.00%
+γ=0.18, iter=400, σ=1.5, flow=800, step=1.6 → 6.40%
+γ=0.18, iter=400, σ=2.0, flow=400, step=0.8 → 6.85%
+γ=0.18, iter=400, σ=2.0, flow=400, step=1.2 → 7.44%
+γ=0.18, iter=400, σ=2.0, flow=400, step=1.6 → 4.97%
+γ=0.18, iter=400, σ=2.0, flow=600, step=0.8 → 7.51%
+γ=0.18, iter=400, σ=2.0, flow=600, step=1.2 → 5.54%
+γ=0.18, iter=400, σ=2.0, flow=600, step=1.6 → 8.02%
+γ=0.18, iter=400, σ=2.0, flow=800, step=0.8 → 2.50%
+γ=0.18, iter=400, σ=2.0, flow=800, step=1.2 → 5.43%
+γ=0.18, iter=400, σ=2.0, flow=800, step=1.6 → 6.35%
+γ=0.18, iter=400, σ=2.5, flow=400, step=0.8 → 9.23%
+γ=0.18, iter=400, σ=2.5, flow=400, step=1.2 → 7.42%
+γ=0.18, iter=400, σ=2.5, flow=400, step=1.6 → 6.05%
+γ=0.18, iter=400, σ=2.5, flow=600, step=0.8 → 7.84%
+γ=0.18, iter=400, σ=2.5, flow=600, step=1.2 → 5.68%
+γ=0.18, iter=400, σ=2.5, flow=600, step=1.6 → 7.60%
+γ=0.18, iter=400, σ=2.5, flow=800, step=0.8 → 5.69%
+γ=0.18, iter=400, σ=2.5, flow=800, step=1.2 → 3.84%
+γ=0.18, iter=400, σ=2.5, flow=800, step=1.6 → 2.17%
+γ=0.18, iter=600, σ=1.5, flow=400, step=0.8 → 5.21%
+γ=0.18, iter=600, σ=1.5, flow=400, step=1.2 → 5.06%
+γ=0.18, iter=600, σ=1.5, flow=400, step=1.6 → 4.88%
+γ=0.18, iter=600, σ=1.5, flow=600, step=0.8 → 9.03%
+γ=0.18, iter=600, σ=1.5, flow=600, step=1.2 → 5.67%
+γ=0.18, iter=600, σ=1.5, flow=600, step=1.6 → 4.14%
+γ=0.18, iter=600, σ=1.5, flow=800, step=0.8 → 8.02%
+γ=0.18, iter=600, σ=1.5, flow=800, step=1.2 → 8.98%
+γ=0.18, iter=600, σ=1.5, flow=800, step=1.6 → 4.54%
+γ=0.18, iter=600, σ=2.0, flow=400, step=0.8 → 8.75%
+γ=0.18, iter=600, σ=2.0, flow=400, step=1.2 → 6.39%
+γ=0.18, iter=600, σ=2.0, flow=400, step=1.6 → 6.36%
+γ=0.18, iter=600, σ=2.0, flow=600, step=0.8 → 3.24%
+γ=0.18, iter=600, σ=2.0, flow=600, step=1.2 → 9.05%
+γ=0.18, iter=600, σ=2.0, flow=600, step=1.6 → 6.81%
+γ=0.18, iter=600, σ=2.0, flow=800, step=0.8 → 6.82%
+γ=0.18, iter=600, σ=2.0, flow=800, step=1.2 → 9.03%
+γ=0.18, iter=600, σ=2.0, flow=800, step=1.6 → 5.27%
+γ=0.18, iter=600, σ=2.5, flow=400, step=0.8 → 5.62%
+γ=0.18, iter=600, σ=2.5, flow=400, step=1.2 → 5.99%
+γ=0.18, iter=600, σ=2.5, flow=400, step=1.6 → 6.37%
+γ=0.18, iter=600, σ=2.5, flow=600, step=0.8 → 4.58%
+γ=0.18, iter=600, σ=2.5, flow=600, step=1.2 → 5.88%
+γ=0.18, iter=600, σ=2.5, flow=600, step=1.6 → 2.23%
+γ=0.18, iter=600, σ=2.5, flow=800, step=0.8 → 4.42%
+γ=0.18, iter=600, σ=2.5, flow=800, step=1.2 → 7.36%
+γ=0.18, iter=600, σ=2.5, flow=800, step=1.6 → 6.15%
+γ=0.18, iter=800, σ=1.5, flow=400, step=0.8 → 6.02%
+γ=0.18, iter=800, σ=1.5, flow=400, step=1.2 → 6.12%
+γ=0.18, iter=800, σ=1.5, flow=400, step=1.6 → 8.65%
+γ=0.18, iter=800, σ=1.5, flow=600, step=0.8 → 4.63%
+γ=0.18, iter=800, σ=1.5, flow=600, step=1.2 → 7.65%
+γ=0.18, iter=800, σ=1.5, flow=600, step=1.6 → 6.90%
+γ=0.18, iter=800, σ=1.5, flow=800, step=0.8 → 8.20%
+γ=0.18, iter=800, σ=1.5, flow=800, step=1.2 → 5.15%
+γ=0.18, iter=800, σ=1.5, flow=800, step=1.6 → 3.81%
+γ=0.18, iter=800, σ=2.0, flow=400, step=0.8 → 6.40%
+γ=0.18, iter=800, σ=2.0, flow=400, step=1.2 → 9.30%
+γ=0.18, iter=800, σ=2.0, flow=400, step=1.6 → 5.39%
+γ=0.18, iter=800, σ=2.0, flow=600, step=0.8 → 3.16%
+γ=0.18, iter=800, σ=2.0, flow=600, step=1.2 → 7.89%
+γ=0.18, iter=800, σ=2.0, flow=600, step=1.6 → 7.27%
+γ=0.18, iter=800, σ=2.0, flow=800, step=0.8 → 5.06%
+γ=0.18, iter=800, σ=2.0, flow=800, step=1.2 → 7.30%
+γ=0.18, iter=800, σ=2.0, flow=800, step=1.6 → 6.89%
+γ=0.18, iter=800, σ=2.5, flow=400, step=0.8 → 5.24%
+γ=0.18, iter=800, σ=2.5, flow=400, step=1.2 → 6.83%
+γ=0.18, iter=800, σ=2.5, flow=400, step=1.6 → 6.61%
+γ=0.18, iter=800, σ=2.5, flow=600, step=0.8 → 5.50%
+γ=0.18, iter=800, σ=2.5, flow=600, step=1.2 → 3.91%
+γ=0.18, iter=800, σ=2.5, flow=600, step=1.6 → 6.12%
+γ=0.18, iter=800, σ=2.5, flow=800, step=0.8 → 2.57%
+γ=0.18, iter=800, σ=2.5, flow=800, step=1.2 → 4.59%
+γ=0.18, iter=800, σ=2.5, flow=800, step=1.6 → 5.84%
+γ=0.2, iter=400, σ=1.5, flow=400, step=0.8 → 5.87%
+γ=0.2, iter=400, σ=1.5, flow=400, step=1.2 → 5.95%
+γ=0.2, iter=400, σ=1.5, flow=400, step=1.6 → 5.72%
+γ=0.2, iter=400, σ=1.5, flow=600, step=0.8 → 8.39%
+γ=0.2, iter=400, σ=1.5, flow=600, step=1.2 → 7.49%
+γ=0.2, iter=400, σ=1.5, flow=600, step=1.6 → 7.51%
+γ=0.2, iter=400, σ=1.5, flow=800, step=0.8 → 4.59%
+γ=0.2, iter=400, σ=1.5, flow=800, step=1.2 → 3.30%
+γ=0.2, iter=400, σ=1.5, flow=800, step=1.6 → 7.76%
+γ=0.2, iter=400, σ=2.0, flow=400, step=0.8 → 4.57%
+γ=0.2, iter=400, σ=2.0, flow=400, step=1.2 → 5.90%
+γ=0.2, iter=400, σ=2.0, flow=400, step=1.6 → 7.28%
+γ=0.2, iter=400, σ=2.0, flow=600, step=0.8 → 7.02%
+γ=0.2, iter=400, σ=2.0, flow=600, step=1.2 → 6.86%
+γ=0.2, iter=400, σ=2.0, flow=600, step=1.6 → 5.16%
+γ=0.2, iter=400, σ=2.0, flow=800, step=0.8 → 7.10%
+γ=0.2, iter=400, σ=2.0, flow=800, step=1.2 → 5.29%
+γ=0.2, iter=400, σ=2.0, flow=800, step=1.6 → 5.75%
+γ=0.2, iter=400, σ=2.5, flow=400, step=0.8 → 5.71%
+γ=0.2, iter=400, σ=2.5, flow=400, step=1.2 → 6.33%
+γ=0.2, iter=400, σ=2.5, flow=400, step=1.6 → 4.29%
+γ=0.2, iter=400, σ=2.5, flow=600, step=0.8 → 4.44%
+γ=0.2, iter=400, σ=2.5, flow=600, step=1.2 → 4.90%
+γ=0.2, iter=400, σ=2.5, flow=600, step=1.6 → 9.24%
+γ=0.2, iter=400, σ=2.5, flow=800, step=0.8 → 3.69%
+γ=0.2, iter=400, σ=2.5, flow=800, step=1.2 → 5.52%
+γ=0.2, iter=400, σ=2.5, flow=800, step=1.6 → 6.45%
+γ=0.2, iter=600, σ=1.5, flow=400, step=0.8 → 5.05%
+γ=0.2, iter=600, σ=1.5, flow=400, step=1.2 → 6.17%
+γ=0.2, iter=600, σ=1.5, flow=400, step=1.6 → 7.70%
+γ=0.2, iter=600, σ=1.5, flow=600, step=0.8 → 5.91%
+γ=0.2, iter=600, σ=1.5, flow=600, step=1.2 → 6.19%
+γ=0.2, iter=600, σ=1.5, flow=600, step=1.6 → 6.62%
+γ=0.2, iter=600, σ=1.5, flow=800, step=0.8 → 7.52%
+γ=0.2, iter=600, σ=1.5, flow=800, step=1.2 → 4.92%
+γ=0.2, iter=600, σ=1.5, flow=800, step=1.6 → 7.28%
+γ=0.2, iter=600, σ=2.0, flow=400, step=0.8 → 4.94%
+γ=0.2, iter=600, σ=2.0, flow=400, step=1.2 → 6.26%
+γ=0.2, iter=600, σ=2.0, flow=400, step=1.6 → 7.83%
+γ=0.2, iter=600, σ=2.0, flow=600, step=0.8 → 4.42%
+γ=0.2, iter=600, σ=2.0, flow=600, step=1.2 → 8.21%
+γ=0.2, iter=600, σ=2.0, flow=600, step=1.6 → 5.36%
+γ=0.2, iter=600, σ=2.0, flow=800, step=0.8 → 8.46%
+γ=0.2, iter=600, σ=2.0, flow=800, step=1.2 → 7.34%
+γ=0.2, iter=600, σ=2.0, flow=800, step=1.6 → 6.01%
+γ=0.2, iter=600, σ=2.5, flow=400, step=0.8 → 6.70%
+γ=0.2, iter=600, σ=2.5, flow=400, step=1.2 → 6.94%
+γ=0.2, iter=600, σ=2.5, flow=400, step=1.6 → 5.91%
+γ=0.2, iter=600, σ=2.5, flow=600, step=0.8 → 4.88%
+γ=0.2, iter=600, σ=2.5, flow=600, step=1.2 → 5.35%
+γ=0.2, iter=600, σ=2.5, flow=600, step=1.6 → 6.36%
+γ=0.2, iter=600, σ=2.5, flow=800, step=0.8 → 7.85%
+γ=0.2, iter=600, σ=2.5, flow=800, step=1.2 → 6.59%
+γ=0.2, iter=600, σ=2.5, flow=800, step=1.6 → 4.17%
+γ=0.2, iter=800, σ=1.5, flow=400, step=0.8 → 5.18%
+γ=0.2, iter=800, σ=1.5, flow=400, step=1.2 → 6.83%
+γ=0.2, iter=800, σ=1.5, flow=400, step=1.6 → 5.84%
+γ=0.2, iter=800, σ=1.5, flow=600, step=0.8 → 5.20%
+γ=0.2, iter=800, σ=1.5, flow=600, step=1.2 → 5.56%
+γ=0.2, iter=800, σ=1.5, flow=600, step=1.6 → 6.78%
+γ=0.2, iter=800, σ=1.5, flow=800, step=0.8 → 7.43%
+γ=0.2, iter=800, σ=1.5, flow=800, step=1.2 → 7.95%
+γ=0.2, iter=800, σ=1.5, flow=800, step=1.6 → 7.89%
+γ=0.2, iter=800, σ=2.0, flow=400, step=0.8 → 5.63%
+γ=0.2, iter=800, σ=2.0, flow=400, step=1.2 → 4.54%
+γ=0.2, iter=800, σ=2.0, flow=400, step=1.6 → 4.80%
+γ=0.2, iter=800, σ=2.0, flow=600, step=0.8 → 4.37%
+γ=0.2, iter=800, σ=2.0, flow=600, step=1.2 → 5.48%
+γ=0.2, iter=800, σ=2.0, flow=600, step=1.6 → 6.92%
+γ=0.2, iter=800, σ=2.0, flow=800, step=0.8 → 6.30%
+γ=0.2, iter=800, σ=2.0, flow=800, step=1.2 → 5.75%
+γ=0.2, iter=800, σ=2.0, flow=800, step=1.6 → 6.63%
+γ=0.2, iter=800, σ=2.5, flow=400, step=0.8 → 5.52%
+γ=0.2, iter=800, σ=2.5, flow=400, step=1.2 → 5.88%
+γ=0.2, iter=800, σ=2.5, flow=400, step=1.6 → 4.47%
+γ=0.2, iter=800, σ=2.5, flow=600, step=0.8 → 7.46%
+γ=0.2, iter=800, σ=2.5, flow=600, step=1.2 → 8.00%
+γ=0.2, iter=800, σ=2.5, flow=600, step=1.6 → 2.84%
+γ=0.2, iter=800, σ=2.5, flow=800, step=0.8 → 5.86%
+γ=0.2, iter=800, σ=2.5, flow=800, step=1.2 → 4.98%
+γ=0.2, iter=800, σ=2.5, flow=800, step=1.6 → 6.30%
+
+Saved → mts_parameter_sweep.csv
+
+===== TOP 10 CONFIGURATIONS =====
+9.32% → γ=0.16, iter=800, σ=2.0, flow=600, step=1.2
+9.30% → γ=0.18, iter=800, σ=2.0, flow=400, step=1.2
+9.24% → γ=0.2, iter=400, σ=2.5, flow=600, step=1.6
+9.23% → γ=0.18, iter=400, σ=2.5, flow=400, step=0.8
+9.05% → γ=0.18, iter=600, σ=2.0, flow=600, step=1.2
+9.03% → γ=0.18, iter=600, σ=2.0, flow=800, step=1.2
+9.03% → γ=0.18, iter=600, σ=1.5, flow=600, step=0.8
+8.98% → γ=0.18, iter=600, σ=1.5, flow=800, step=1.2
+8.90% → γ=0.14, iter=600, σ=1.5, flow=800, step=1.6
+8.75% → γ=0.18, iter=600, σ=2.0, flow=400, step=0.8
