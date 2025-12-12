@@ -1,0 +1,1585 @@
+# ============================================================
+# MTS–Γ C4 GPU / CPU TSP SOLVER (LARGE-N SCALING VERSION)
+# ============================================================
+#
+# This script implements a scalable Euclidean TSP solver based on the
+# Motion–TimeSpace Γ (Gamma) C4 refinement framework.
+#
+# IMPORTANT CONTEXT (READ THIS):
+#
+# • This solver is designed for LARGE-N experiments (N ≳ 500 up to several thousand).
+# • Full Christofides on the complete graph is computationally infeasible at these sizes.
+#
+# BASELINE USED:
+# • A Christofides-STYLE heuristic constructed on a k-nearest-neighbour (k-NN) graph
+#   (default k = 20), which is standard practice in large-N TSP literature.
+# • The baseline and the MTS-Γ refinement operate on the SAME initial tour
+#   (apples-to-apples comparison within each run).
+#
+# MTS–Γ C4 REFINEMENT:
+# • Phase 1: GPU-accelerated 2-opt (via OpenCL) if available,
+#            otherwise CPU 2.5-opt fallback.
+# • Phase 2: Optional 3-opt with REAL k-NN pruning (disabled by default at high N).
+# • Iterative refinement continues until no further improvement is found.
+#
+# MEASUREMENT:
+# • All reported improvements are relative to the Christofides(k-NN) baseline
+#   computed in the same run.
+# • Improvements are monotonic and logged per iteration.
+#
+# NOTES:
+# • This is a heuristic solver, not an exact algorithm.
+# • Results are intended for scaling, stability, and comparative performance analysis.
+# • GPU acceleration is optional; CPU-only execution remains fully valid.
+#
+# ============================================================
+
+import numpy as np
+import time
+import networkx as nx
+import argparse
+import csv
+
+try:
+    import pyopencl as cl
+except Exception:
+    cl = None
+
+GRID = 512
+_NODES = 6500
+_SEED = 1
+
+# -------------------- Basic helpers --------------------
+
+def dist(a, b):
+    return ((a[0]-b[0])**2 + (a[1]-b[1])**2)**0.5
+
+def tour_length(order, coords):
+    """Open-path length: sum over consecutive edges only (no return to start)."""
+    tot = 0.0
+    for i in range(len(order) - 1):
+        tot += dist(coords[order[i]], coords[order[i + 1]])
+    return tot
+
+def tour_length_from_D(order, D):
+    """Same as tour_length but using the precomputed distance matrix D."""
+    return sum(float(D[order[i], order[i + 1]]) for i in range(len(order) - 1))
+
+# -------------------- CSV Logging --------------------
+
+def log_improvement(history_file, iteration, new_len, delta, elapsed):
+    """Appends a record to the improvement history CSV."""
+    if not history_file:
+        return
+    try:
+        with open(history_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if f.tell() == 0:
+                writer.writerow([
+                    'iteration',
+                    'timestamp',
+                    'new_best_distance',
+                    'improvement_delta',
+                    'iteration_elapsed_s'
+                ])
+            writer.writerow([
+                iteration,
+                time.strftime("%Y-%m-%d %H:%M:%S"),
+                f"{new_len:.4f}",
+                f"{delta:.4f}",
+                f"{elapsed:.2f}"
+            ])
+    except IOError as e:
+        print(f"[Error] Could not write to history file {history_file}: {e}", flush=True)
+
+def save_tour_to_csv(tour_file, route, coords):
+    """Saves the final ordered coordinates to a CSV file."""
+    if not tour_file:
+        return
+    try:
+        ordered_coords = coords[route]
+        with open(tour_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['x', 'y'])
+            writer.writerows(ordered_coords)
+        print(f"[Output] Final tour saved to {tour_file},{_NODES} nodes with {_SEED} seeds", flush=True)
+    except IOError as e:
+        print(f"[Error] Could not save tour to file {tour_file}: {e}", flush=True)
+
+# -------------------- Christofides-style via k-NN graph --------------------
+
+def christofides_knn_from_D(D, k=20):
+    """
+    Christofides-style heuristic using a k-NN graph instead of Delaunay.
+
+    - Graph has edges from each node to its k nearest neighbours (by distance in D).
+    - Runs MST -> min-weight matching on odd-degree vertices -> Eulerian circuit.
+    - Returns an open tour (sequence of node indices).
+    """
+    N = D.shape[0]
+    G = nx.Graph()
+
+    k = int(k)
+    if k < 1:
+        k = 1
+    if k > N - 1:
+        k = N - 1
+
+    print(f"[Christofides-KNN] Building k-NN graph with k={k}", flush=True)
+    for i in range(N):
+        row = D[i]
+        idx = np.argpartition(row, k + 1)[:k + 1]
+        for j in idx:
+            if j == i:
+                continue
+            w = float(row[j])
+            if not G.has_edge(i, j):
+                G.add_edge(i, j, weight=w)
+
+    if not nx.is_connected(G):
+        print("[Christofides-KNN] Graph not connected; adding nearest-neighbour edges to connect components", flush=True)
+        for i in range(N):
+            row = D[i]
+            j = int(np.argsort(row)[1])
+            w = float(row[j])
+            if not G.has_edge(i, j):
+                G.add_edge(i, j, weight=w)
+        if not nx.is_connected(G):
+            raise RuntimeError("[Christofides-KNN] Graph still not connected after repair; increase k.")
+
+    print("[Christofides-KNN] Computing MST...", flush=True)
+    mst = nx.minimum_spanning_tree(G, weight="weight")
+
+    odd_nodes = [node for node, degree in mst.degree() if degree % 2 == 1]
+
+    print("[Christofides-KNN] Computing minimum-weight matching on odd nodes...", flush=True)
+    K = nx.Graph()
+    for idx_u, u in enumerate(odd_nodes):
+        for v in odd_nodes[idx_u + 1:]:
+            w = float(D[u, v])
+            K.add_edge(u, v, weight=w)
+    matching = nx.min_weight_matching(K, weight="weight")
+
+    multigraph = nx.MultiGraph()
+    multigraph.add_edges_from(mst.edges(data=True))
+    for u, v in matching:
+        multigraph.add_edge(u, v, weight=float(D[u, v]))
+
+    print("[Christofides-KNN] Computing Eulerian circuit...", flush=True)
+    circuit = list(nx.eulerian_circuit(multigraph))
+
+    visited = set()
+    tour = []
+    for u, v in circuit:
+        if u not in visited:
+            tour.append(u)
+            visited.add(u)
+        if v not in visited:
+            tour.append(v)
+            visited.add(v)
+
+    if len(tour) < N:
+        missing = [node for node in range(N) if node not in visited]
+        tour.extend(missing)
+
+    return tour
+
+# -------------------- OpenCL kernels --------------------
+
+_opencl_program_src = r"""
+__kernel void pairwise_dist(
+    __global const float *pts, // flattened [x0,y0,x1,y1,...]
+    __global float *D,
+    const int N
+){
+    int i = get_global_id(0);
+    int j = get_global_id(1);
+    if (i < N && j < N){
+        float ix = pts[2*i + 0];
+        float iy = pts[2*i + 1];
+        float jx = pts[2*j + 0];
+        float jy = pts[2*j + 1];
+        float dx = ix - jx;
+        float dy = iy - jy;
+        D[i*N + j] = sqrt(dx*dx + dy*dy);
+    }
+}
+"""
+
+_opencl_two_opt_src = r"""
+__kernel void best_two_opt(
+    __global const int *route,
+    __global const float *D,
+    const int n,
+    __global float *best_delta,
+    __global int *best_i,
+    __global int *best_j
+){
+    int i = get_global_id(0);
+
+    if (i < 1 || i >= n - 2) {
+        best_delta[i] = 0.0f;
+        best_i[i] = -1;
+        best_j[i] = -1;
+        return;
+    }
+
+    float best_d = 0.0f;
+    int bi = -1;
+    int bj = -1;
+
+    int A = route[i - 1];
+    int B = route[i];
+
+    for (int j = i + 1; j < n - 1; ++j) {
+        int C = route[j];
+        int Dv = route[j + 1];
+
+        float old_cost = D[A * n + B] + D[C * n + Dv];
+        float new_cost = D[A * n + C] + D[B * n + Dv];
+        float delta = new_cost - old_cost;
+
+        if (delta < best_d) {
+            best_d = delta;
+            bi = i;
+            bj = j;
+        }
+    }
+
+    best_delta[i] = best_d;
+    best_i[i] = bi;
+    best_j[i] = bj;
+}
+"""
+
+def _get_opencl_context():
+    if cl is None:
+        return None
+    try:
+        platforms = cl.get_platforms()
+        for p in platforms:
+            gpus = [d for d in p.get_devices() if d.type & cl.device_type.GPU]
+            if gpus:
+                return cl.Context(devices=gpus)
+        devices = [d for p in platforms for d in p.get_devices()]
+        if devices:
+            return cl.Context(devices=devices)
+    except Exception:
+        return None
+    return None
+
+# -------------------- OpenCL distance matrix --------------------
+
+def compute_distance_matrix_opencl(coords):
+    """
+    Returns:
+        D (N x N float32),
+        used_gpu (bool),
+        ctx (pyopencl.Context or None)
+    """
+    N = coords.shape[0]
+    D = np.empty((N, N), dtype=np.float32)
+    ctx = _get_opencl_context()
+    if ctx is None or cl is None:
+        print("[D-matrix] Using CPU fallback (no OpenCL / GPU).", flush=True)
+        for i in range(N):
+            dx = coords[i, 0] - coords[:, 0]
+            dy = coords[i, 1] - coords[:, 1]
+            D[i, :] = np.sqrt(dx * dx + dy * dy)
+        return D, False, None
+
+    print("[D-matrix] Using GPU via OpenCL.", flush=True)
+    queue = cl.CommandQueue(ctx)
+    prg = cl.Program(ctx, _opencl_program_src).build()
+
+    pts = np.ascontiguousarray(coords.astype(np.float32)).reshape(-1)
+    mf = cl.mem_flags
+    pts_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=pts)
+    D_buf = cl.Buffer(ctx, mf.WRITE_ONLY, D.nbytes)
+
+    global_size = (int(N), int(N))
+    local_size = None
+
+    prg.pairwise_dist(queue, global_size, local_size, pts_buf, D_buf, np.int32(N))
+    cl.enqueue_copy(queue, D, D_buf).wait()
+
+    return D, True, ctx
+
+# -------------------- GPU-accelerated 2-opt using D --------------------
+
+def gpu_two_opt_with_D(route, D, ctx, max_passes=5, verbose=True):
+    """
+    Perform several passes of 2-opt using the GPU to evaluate candidate moves.
+    """
+    if ctx is None or cl is None:
+        return route
+
+    route = np.array(route, dtype=np.int32)
+    n = route.shape[0]
+    if n < 4:
+        return list(route)
+
+    D_flat = np.ascontiguousarray(D.astype(np.float32).reshape(-1))
+    queue = cl.CommandQueue(ctx)
+    mf = cl.mem_flags
+
+    prg = cl.Program(ctx, _opencl_two_opt_src).build()
+    kernel = prg.best_two_opt
+    D_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=D_flat)
+
+    for pass_idx in range(max_passes):
+        start_pass = time.time()
+
+        route_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=route)
+
+        best_delta = np.empty(n, dtype=np.float32)
+        best_i = np.empty(n, dtype=np.int32)
+        best_j = np.empty(n, dtype=np.int32)
+
+        best_delta_buf = cl.Buffer(ctx, mf.WRITE_ONLY, best_delta.nbytes)
+        best_i_buf = cl.Buffer(ctx, mf.WRITE_ONLY, best_i.nbytes)
+        best_j_buf = cl.Buffer(ctx, mf.WRITE_ONLY, best_j.nbytes)
+
+        global_size = (int(n),)
+        local_size = None
+
+        kernel(
+            queue,
+            global_size,
+            local_size,
+            route_buf,
+            D_buf,
+            np.int32(n),
+            best_delta_buf,
+            best_i_buf,
+            best_j_buf
+        )
+
+        cl.enqueue_copy(queue, best_delta, best_delta_buf).wait()
+        cl.enqueue_copy(queue, best_i, best_i_buf).wait()
+        cl.enqueue_copy(queue, best_j, best_j_buf).wait()
+
+        idx = int(np.argmin(best_delta))
+        delta = float(best_delta[idx])
+        i_star = int(best_i[idx])
+        j_star = int(best_j[idx])
+
+        if delta >= -1e-12 or i_star < 0 or j_star <= i_star:
+            if verbose:
+                elapsed = time.time() - start_pass
+                print(f"[GPU 2-opt] pass {pass_idx + 1}: no further improvement (elapsed {elapsed:.2f}s)", flush=True)
+            break
+
+        route[i_star:j_star + 1] = route[i_star:j_star + 1][::-1]
+
+        if verbose:
+            elapsed = time.time() - start_pass
+            print(
+                f"[GPU 2-opt] pass {pass_idx + 1}: best Δ = {delta:.6f}, "
+                f"i={i_star}, j={j_star}, elapsed {elapsed:.2f}s",
+                flush=True
+            )
+
+    return list(route)
+
+# -------------------- CPU 2.5-opt (fallback) --------------------
+
+def two_point_five_opt_with_D(route, D):
+    """Original CPU 2.5-opt as a fallback when GPU isn't available."""
+    n = len(route)
+    total_checks = 0
+    for i in range(1, n - 2):
+        for j in range(i + 2, n - 1):
+            total_checks += 1
+    improved = True
+    while improved:
+        improved = False
+        checks_done = 0
+        start_ts = time.time()
+        last_log = start_ts
+        for i in range(1, n - 2):
+            for j in range(i + 2, n - 1):
+                checks_done += 1
+                now = time.time()
+                if total_checks > 0 and now - last_log >= 300:
+                    pct = min(100.0, (checks_done / total_checks) * 100.0)
+                    print(
+                        f"[2.5-opt] progress {pct:.1f}% (elapsed {(now - start_ts) / 60:.1f} min)",
+                        flush=True,
+                    )
+                    last_log = now
+                A, B = route[i - 1], route[i]
+                C, E = route[j], route[j + 1]
+                old = float(D[A, B]) + float(D[C, E])
+                new = float(D[A, C]) + float(D[B, E])
+                if new < old - 1e-12:
+                    route[i:j + 1] = reversed(route[i:j + 1])
+                    improved = True
+    return route
+
+# -------------------- 3-opt with REAL KNN pruning --------------------
+
+def three_opt_with_D(route, D, knn_prune_k=None):
+    """
+    3-opt with proper KNN-based pruning.
+
+    - If knn_prune_k is None or <= 0: 3-opt is skipped (returns route unchanged).
+    - Otherwise:
+        * Build KNN sets on node IDs using D.
+        * For each position i, only consider j at positions corresponding to
+          neighbors of route[i] or route[i+1].
+        * For each (i, j), only consider k3 at positions corresponding to
+          neighbors of route[j] or route[j+1].
+        * After a successful improvement, restart with a fresh pos_of map.
+    """
+    n = len(route)
+    if knn_prune_k is None or knn_prune_k <= 0:
+        # Explicitly disabled → no 3-opt
+        return route
+
+    def seg(rt, a, b):
+        return float(D[rt[a], rt[b]])
+
+    # Build KNN sets on node indices 0..n-1
+    k = min(int(knn_prune_k), n - 1)
+    knn = [set() for _ in range(n)]
+    for idx in range(n):
+        row = D[idx]
+        nbrs = np.argsort(row)[:k + 1]
+        nbrs = [int(u) for u in nbrs if u != idx][:k]
+        knn[idx] = set(nbrs)
+
+    improved_global = True
+    while improved_global:
+        improved_global = False
+        # Map from node id -> position in route
+        pos_of = {node: pos for pos, node in enumerate(route)}
+
+        for i in range(0, n - 3):
+            A = route[i]
+            B = route[i + 1]
+
+            # Candidate j positions come from neighbours of A or B
+            candidate_js = set()
+            for v in knn[A]:
+                j = pos_of[v]
+                if j > i + 1 and j < n - 2:
+                    candidate_js.add(j)
+            for v in knn[B]:
+                j = pos_of[v]
+                if j > i + 1 and j < n - 2:
+                    candidate_js.add(j)
+
+            candidate_js = sorted(candidate_js)
+            if not candidate_js:
+                continue
+
+            improved_here = False
+
+            for j in candidate_js:
+                C = route[j]
+                Dv = route[j + 1]
+
+                # Candidate k3 positions from neighbours of C or Dv
+                candidate_ks = set()
+                for v in knn[C]:
+                    k3 = pos_of[v]
+                    if k3 > j + 1 and k3 < n - 1:
+                        candidate_ks.add(k3)
+                for v in knn[Dv]:
+                    k3 = pos_of[v]
+                    if k3 > j + 1 and k3 < n - 1:
+                        candidate_ks.add(k3)
+
+                candidate_ks = sorted(candidate_ks)
+                if not candidate_ks:
+                    continue
+
+                for k3 in candidate_ks:
+                    old_cost = seg(route, i, i + 1) + seg(route, j, j + 1) + seg(route, k3, k3 + 1)
+
+                    r1 = route.copy()
+                    r1[i + 1:j + 1] = reversed(r1[i + 1:j + 1])
+                    c1 = seg(r1, i, i + 1) + seg(r1, j, j + 1) + seg(r1, k3, k3 + 1)
+
+                    r2 = route.copy()
+                    r2[j + 1:k3 + 1] = reversed(r2[j + 1:k3 + 1])
+                    c2 = seg(r2, i, i + 1) + seg(r2, j, j + 1) + seg(r2, k3, k3 + 1)
+
+                    r3 = route.copy()
+                    r3[i + 1:j + 1] = reversed(r3[i + 1:j + 1])
+                    r3[j + 1:k3 + 1] = reversed(r3[j + 1:k3 + 1])
+                    c3 = seg(r3, i, i + 1) + seg(r3, j, j + 1) + seg(r3, k3, k3 + 1)
+
+                    best_cost = old_cost
+                    best_route = None
+                    if c1 < best_cost:
+                        best_cost = c1
+                        best_route = r1
+                    if c2 < best_cost:
+                        best_cost = c2
+                        best_route = r2
+                    if c3 < best_cost:
+                        best_cost = c3
+                        best_route = r3
+
+                    if best_route is not None and best_cost < old_cost - 1e-12:
+                        route = best_route
+                        improved_global = True
+                        improved_here = True
+                        break  # break k3 loop
+
+                if improved_here:
+                    break  # break j loop
+
+            if improved_here:
+                break  # break i loop
+
+    return route
+
+# -------------------- Iterative refinement (MTS Γ-C4) --------------------
+
+def mts_gamma_C4_with_D(coords, D, start_route,
+                        max_iterations=None,
+                        knn_prune_k=None,
+                        history_file=None,
+                        gpu_ctx=None):
+    """
+    MTS Γ-C4 loop:
+
+    - Start from `start_route` (typically Christofides-KNN).
+    - Phase 1: if GPU available -> GPU 2-opt; else CPU 2.5-opt.
+    - Phase 2: CPU 3-opt with REAL KNN pruning (or skipped if knn_prune_k <= 0).
+    """
+    order = list(start_route)
+    old_len = tour_length_from_D(order, D)
+    iteration = 0
+    improved = True
+
+    while improved:
+        iteration += 1
+        if max_iterations is not None and iteration > int(max_iterations):
+            print(f"[C4] reached max iterations: {max_iterations}", flush=True)
+            break
+        improved = False
+        iter_start = time.time()
+
+        # Phase 1
+        if gpu_ctx is not None:
+            print(f"[C4] iteration {iteration}: starting GPU 2-opt", flush=True)
+            phase_start = time.time()
+            order = gpu_two_opt_with_D(order, D, gpu_ctx, max_passes=5, verbose=True)
+            phase_1 = time.time() - phase_start
+        else:
+            print(f"[C4] iteration {iteration}: starting 2.5-opt (CPU)", flush=True)
+            phase_start = time.time()
+            order = two_point_five_opt_with_D(order, D)
+            phase_1 = time.time() - phase_start
+
+        # Phase 2: 3-opt (only if knn_prune_k > 0)
+        if knn_prune_k is not None and knn_prune_k > 0:
+            print(f"[C4] iteration {iteration}: starting 3-opt (KNN-pruned)", flush=True)
+            phase_start = time.time()
+            order = three_opt_with_D(order, D, knn_prune_k=knn_prune_k)
+            phase_2 = time.time() - phase_start
+        else:
+            phase_2 = 0.0
+
+        new_len = tour_length_from_D(order, D)
+        if new_len < old_len - 1e-12:
+            delta = old_len - new_len
+            elapsed = time.time() - iter_start
+            print(f"[C4] improvement {iteration}: length {new_len:.4f} (Δ {delta:.4f}), elapsed {elapsed:.2f}s", flush=True)
+            print(f"[C4]   phase times: phase1 {phase_1:.2f}s, 3-opt {phase_2:.2f}s", flush=True)
+            log_improvement(history_file, iteration, new_len, delta, elapsed)
+            improved = True
+            old_len = new_len
+        else:
+            elapsed = time.time() - iter_start
+            print(f"[C4] iteration {iteration}: no further improvement after {elapsed:.2f}s", flush=True)
+            print(f"[C4]   phase times: phase1 {phase_1:.2f}s, 3-opt {phase_2:.2f}s", flush=True)
+
+    return order, old_len
+
+# -------------------- ENTRY --------------------
+
+def run_single(N=_NODES,
+               seed=_SEED,
+               knn_k=20,
+               knn_prune_k=None,
+               max_iterations=None,
+               input_file=None,
+               tour_output_file=None,
+               history_output_file=None):
+    print(f"\n===== Running N = {N} =====")
+    np.random.seed(int(seed))
+
+    if input_file:
+        data = np.loadtxt(input_file, delimiter=",")
+        coords = data.astype(np.float32)
+        N = coords.shape[0]
+        print(f"[Input] Loaded {N} points from {input_file}", flush=True)
+    else:
+        coords = np.random.rand(N, 2).astype(np.float32) * (GRID - 4)
+
+    print("Computing distance matrix (OpenCL if available)…")
+    t2 = time.time()
+    D, used_gpu, ctx = compute_distance_matrix_opencl(coords)
+    t3 = time.time()
+    print(f"Distance matrix via {'GPU' if used_gpu else 'CPU'}: time={t3 - t2:.2f}s")
+
+    print("Computing Christofides (k-NN graph)…")
+    t0 = time.time()
+    c_route = christofides_knn_from_D(D, k=knn_k)
+    c_len = tour_length_from_D(c_route, D)
+    t1 = time.time()
+    print(f"Christofides(KNN) length: {c_len:.4f}   time={t1 - t0:.2f}s")
+
+    print("Running MTS–Gamma C4…")
+    t4 = time.time()
+    m_route, m_len = mts_gamma_C4_with_D(
+        coords,
+        D,
+        start_route=c_route,
+        max_iterations=max_iterations,
+        knn_prune_k=knn_prune_k,
+        history_file=history_output_file,
+        gpu_ctx=ctx if used_gpu else None
+    )
+    t5 = time.time()
+    print(f"MTS–Γ C4 length:     {m_len:.4f}   time={t5 - t4:.2f}s")
+
+    improvement = (c_len - m_len) / c_len * 100.0
+    print(f"\nImprovement over Christofides(KNN): {improvement:.4f} %")
+
+    save_tour_to_csv(tour_output_file, m_route, coords)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="GPU-accelerated TSP solver with OpenCL (no Delaunay).")
+    parser.add_argument("-n", "--nodes", type=int, default=_NODES,
+                        help="Number of nodes to generate if no input file is provided.")
+    parser.add_argument("-i", "--input", type=str, default=None,
+                        help="Path to a CSV file with coordinates (x,y). Overrides -n.")
+    parser.add_argument("-s", "--seed", type=int, default=_SEED,
+                        help="Random seed for coordinate generation.")
+    parser.add_argument("--knn-k", type=int, default=20,
+                        help="k for k-NN graph used by Christofides baseline.")
+    parser.add_argument("--knn-prune-k", type=int, default=None,
+                        help="K-value for 3-opt KNN pruning. If <= 0, 3-opt is disabled.")
+    parser.add_argument("--max-iterations", type=int, default=None,
+                        help="Maximum number of refinement iterations for the C4 loop.")
+    parser.add_argument("--tour-output", type=str, default="c9_final_tour.csv",
+                        help="File to save the final tour coordinates to.")
+    parser.add_argument("--history-output", type=str, default="c9_improvement_history.csv",
+                        help="File to log improvement history to.")
+
+    args = parser.parse_args()
+
+    run_single(
+        N=args.nodes,
+        seed=args.seed,
+        knn_k=args.knn_k,
+        knn_prune_k=args.knn_prune_k,
+        max_iterations=args.max_iterations,
+        input_file=args.input,
+        tour_output_file=args.tour_output,
+        history_output_file=args.history_output
+    )
+
+
+test 1 (i think this was 42 seeds on CPU):
+              ===== Running N = 1000 =====
+Computing Christofides (Delaunay graph)…
+Christofides length: 13213.5890   time=112.54s
+Running MTS–Gamma C4…
+[C4] iteration 1: starting 2.5-opt
+[C4] iteration 1: starting 3-opt
+[3-opt] progress 2.7% (elapsed 5.0 min)
+[3-opt] progress 5.5% (elapsed 10.0 min)
+[3-opt] progress 8.4% (elapsed 15.0 min)
+[3-opt] progress 11.3% (elapsed 20.0 min)
+[3-opt] progress 14.2% (elapsed 25.0 min)
+[3-opt] progress 17.1% (elapsed 30.0 min)
+[3-opt] progress 20.1% (elapsed 35.0 min)
+[3-opt] progress 23.1% (elapsed 40.0 min)
+[3-opt] progress 26.0% (elapsed 45.0 min)
+[3-opt] progress 29.0% (elapsed 50.0 min)
+[3-opt] progress 32.0% (elapsed 55.0 min)
+[3-opt] progress 35.0% (elapsed 60.0 min)
+[3-opt] progress 38.1% (elapsed 65.0 min)
+[3-opt] progress 41.1% (elapsed 70.0 min)
+[3-opt] progress 44.1% (elapsed 75.0 min)
+[3-opt] progress 47.2% (elapsed 80.0 min)
+[3-opt] progress 50.3% (elapsed 85.0 min)
+[3-opt] progress 53.4% (elapsed 90.0 min)
+[3-opt] progress 56.5% (elapsed 95.0 min)
+[3-opt] progress 59.7% (elapsed 100.0 min)
+[3-opt] progress 62.8% (elapsed 105.0 min)
+[3-opt] progress 66.0% (elapsed 110.0 min)
+[3-opt] progress 69.2% (elapsed 115.0 min)
+[3-opt] progress 72.4% (elapsed 120.0 min)
+[3-opt] progress 75.6% (elapsed 125.0 min)
+[3-opt] progress 78.9% (elapsed 130.0 min)
+[3-opt] progress 82.1% (elapsed 135.0 min)
+[3-opt] progress 85.3% (elapsed 140.0 min)
+[3-opt] progress 88.6% (elapsed 145.0 min)
+[3-opt] progress 91.9% (elapsed 150.0 min)
+[3-opt] progress 95.4% (elapsed 155.0 min)
+[3-opt] progress 98.9% (elapsed 160.0 min)
+[3-opt] progress 2.8% (elapsed 5.0 min)
+[3-opt] progress 5.5% (elapsed 10.0 min)
+[3-opt] progress 8.3% (elapsed 15.0 min)
+[3-opt] progress 11.2% (elapsed 20.0 min)
+[3-opt] progress 14.0% (elapsed 25.0 min)
+[3-opt] progress 16.9% (elapsed 30.0 min)
+[3-opt] progress 19.6% (elapsed 35.0 min)
+[3-opt] progress 22.5% (elapsed 40.0 min)
+[3-opt] progress 25.3% (elapsed 45.0 min)
+[3-opt] progress 28.2% (elapsed 50.0 min)
+[3-opt] progress 31.0% (elapsed 55.0 min)
+[3-opt] progress 33.9% (elapsed 60.0 min)
+[3-opt] progress 37.0% (elapsed 65.0 min)
+[3-opt] progress 41.2% (elapsed 70.0 min)
+[3-opt] progress 45.6% (elapsed 75.0 min)
+[3-opt] progress 50.0% (elapsed 80.0 min)
+[3-opt] progress 54.5% (elapsed 85.0 min)
+[3-opt] progress 59.2% (elapsed 90.0 min)
+[3-opt] progress 65.1% (elapsed 95.0 min)
+[3-opt] progress 71.7% (elapsed 100.0 min)
+[3-opt] progress 78.5% (elapsed 105.0 min)
+[3-opt] progress 85.4% (elapsed 110.0 min)
+[3-opt] progress 92.5% (elapsed 115.0 min)
+[C4] improvement 1: length 12945.4197 (Δ 165458.5758), elapsed 16917.24s
+[C4] iteration 2: starting 2.5-opt
+[C4] iteration 2: starting 3-opt
+[3-opt] progress 6.0% (elapsed 5.0 min)
+[3-opt] progress 12.1% (elapsed 10.0 min)
+[3-opt] progress 18.2% (elapsed 15.0 min)
+[3-opt] progress 24.3% (elapsed 20.0 min)
+[3-opt] progress 30.5% (elapsed 25.0 min)
+[3-opt] progress 36.7% (elapsed 30.0 min)
+[3-opt] progress 43.0% (elapsed 35.0 min)
+[3-opt] progress 49.3% (elapsed 40.0 min)
+[3-opt] progress 55.7% (elapsed 45.0 min)
+[3-opt] progress 62.2% (elapsed 50.0 min)
+[3-opt] progress 68.8% (elapsed 55.0 min)
+[3-opt] progress 75.5% (elapsed 60.0 min)
+[3-opt] progress 82.3% (elapsed 65.0 min)
+[3-opt] progress 89.3% (elapsed 70.0 min)
+[3-opt] progress 96.6% (elapsed 75.0 min)
+[C4] iteration 2: no further improvement after 21549.12s
+MTS–Γ C4 length:     12945.4197   time=21549.12s
+ 
+Improvement: 2.0295 %
+ 
+ 
+test 2 and 3 (varied N, seed was 1, using KNN on GPU):
+9d8cb8
+===== Running N = 100 =====
+Computing distance matrix (OpenCL if available)…
+[D-matrix] Using GPU via OpenCL.
+Distance matrix via GPU: time=0.38s
+Computing Christofides (k-NN graph)…
+[Christofides-KNN] Building k-NN graph with k=20
+[Christofides-KNN] Computing MST...
+[Christofides-KNN] Computing Eulerian circuit...
+Christofides(KNN) length: 4300.0120   time=0.04s
+Running MTS–Gamma C4…
+[C4] iteration 1: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -62.443146, i=46, j=51, elapsed 0.00s
+E:\Silk Stuff\amazon\c11.py:328: RepeatedKernelRetrieval: Kernel 'best_two_opt' has been retrieved more than once. Each retrieval creates a new, independent kernel, at possibly considerable expense. To avoid the expense, reuse the retrieved kernel instance. To avoid this warning, use cl.Kernel(prg, name).  prg.best_two_opt(
+[GPU 2-opt] pass 2: best Δ = -49.560959, i=43, j=59, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -34.312546, i=73, j=75, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -29.000397, i=68, j=69, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -28.796127, i=66, j=71, elapsed 0.00s
+[C4] iteration 1: starting 3-opt
+[C4] improvement 1: length 4052.3148 (Δ 247.6972), elapsed 2.54s
+[C4]   phase times: phase1 0.09s, 3-opt 2.45s
+[C4] iteration 2: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -16.881088, i=1, j=98, elapsed 0.00s
+[GPU 2-opt] pass 2: no further improvement (elapsed 0.00s)
+[C4] iteration 2: starting 3-opt
+[C4] improvement 2: length 4035.4337 (Δ 16.8811), elapsed 1.23s
+[C4]   phase times: phase1 0.06s, 3-opt 1.17s
+[C4] iteration 3: starting GPU 2-opt
+[GPU 2-opt] pass 1: no further improvement (elapsed 0.00s)
+[C4] iteration 3: starting 3-opt
+[C4] iteration 3: no further improvement after 1.38s
+[C4]   phase times: phase1 0.02s, 3-opt 1.36s
+MTS–Γ C4 length:     4035.4337   time=5.15s
+
+Improvement over Christofides(KNN): 6.1530 %
+[Output] Final tour saved to c9_final_tour.csv
+PS E:\Silk Stuff\amazon>  e:; cd 'e:\Silk Stuff\amazon'; & 'c:\Python313\python.exe' 'c:\Users\Glyn\.vscode\extensions\ms-python.debugpy-2025.16.0-win32-x64\bundled\libs\debugpy\launcher' '53043' '--' 'E:\Silk Stuff\amazon\c11.py'
+
+===== Running N = 1000 =====
+Computing distance matrix (OpenCL if available)…
+[D-matrix] Using GPU via OpenCL.
+Distance matrix via GPU: time=0.35s
+Computing Christofides (k-NN graph)…
+[Christofides-KNN] Building k-NN graph with k=20
+[Christofides-KNN] Computing MST...
+[Christofides-KNN] Computing minimum-weight matching on odd nodes...
+[Christofides-KNN] Computing Eulerian circuit...
+Christofides(KNN) length: 12915.7153   time=60.79s
+Running MTS–Gamma C4…
+[C4] iteration 1: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -53.455429, i=656, j=670, elapsed 0.00s
+E:\Silk Stuff\amazon\c11.py:328: RepeatedKernelRetrieval: Kernel 'best_two_opt' has been retrieved more than once. Each retrieval creates a new, independent kernel, at possibly considerable expense. To avoid the expense, reuse the retrieved kernel instance. To avoid this warning, use cl.Kernel(prg, name).  prg.best_two_opt(
+[GPU 2-opt] pass 2: best Δ = -34.573109, i=331, j=396, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -33.200775, i=86, j=985, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -30.216583, i=544, j=565, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -22.774540, i=437, j=446, elapsed 0.00s
+[C4] iteration 1: starting 3-opt
+[3-opt] progress 7.4% (elapsed 5.0 min)
+[3-opt] progress 14.9% (elapsed 10.0 min)
+[3-opt] progress 23.1% (elapsed 15.0 min)
+[3-opt] progress 31.5% (elapsed 20.0 min)
+[3-opt] progress 40.0% (elapsed 25.0 min)
+[3-opt] progress 48.7% (elapsed 30.0 min)
+[3-opt] progress 57.5% (elapsed 35.0 min)
+[3-opt] progress 66.5% (elapsed 40.0 min)
+[3-opt] progress 75.8% (elapsed 45.0 min)
+[3-opt] progress 85.4% (elapsed 50.0 min)
+[3-opt] progress 95.6% (elapsed 55.0 min)
+[3-opt] progress 8.1% (elapsed 5.0 min)
+[3-opt] progress 16.0% (elapsed 10.0 min)
+[3-opt] progress 24.2% (elapsed 15.0 min)
+[3-opt] progress 32.6% (elapsed 20.0 min)
+[3-opt] progress 41.1% (elapsed 25.0 min)
+[3-opt] progress 49.7% (elapsed 30.0 min)
+[3-opt] progress 58.5% (elapsed 35.0 min)
+[3-opt] progress 67.5% (elapsed 40.0 min)
+[3-opt] progress 76.8% (elapsed 45.0 min)
+[3-opt] progress 86.4% (elapsed 50.0 min)
+[3-opt] progress 96.6% (elapsed 55.0 min)
+[C4] improvement 1: length 12144.3639 (Δ 771.3514), elapsed 6805.92s
+[C4]   phase times: phase1 0.06s, 3-opt 6805.87s
+[C4] iteration 2: starting GPU 2-opt
+[GPU 2-opt] pass 1: no further improvement (elapsed 0.00s)
+[C4] iteration 2: starting 3-opt
+[3-opt] progress 8.2% (elapsed 5.0 min)
+[3-opt] progress 16.4% (elapsed 10.0 min)
+[3-opt] progress 24.8% (elapsed 15.0 min)
+[3-opt] progress 33.2% (elapsed 20.0 min)
+[3-opt] progress 41.8% (elapsed 25.0 min)
+[3-opt] progress 50.6% (elapsed 30.0 min)
+[3-opt] progress 59.4% (elapsed 35.0 min)
+[3-opt] progress 68.5% (elapsed 40.0 min)
+[3-opt] progress 77.9% (elapsed 45.0 min)
+[3-opt] progress 87.7% (elapsed 50.0 min)
+[3-opt] progress 98.2% (elapsed 55.0 min)
+[C4] iteration 2: no further improvement after 3346.56s
+[C4]   phase times: phase1 0.04s, 3-opt 3346.52s
+MTS–Γ C4 length:     12144.3639   time=10152.49s
+
+Improvement over Christofides(KNN): 5.9722 %
+[Output] Final tour saved to c9_final_tour.csv
+PS E:\Silk Stuff\amazon>  e:; cd 'e:\Silk Stuff\amazon'; & 'c:\Python313\python.exe' 'c:\Users\Glyn\.vscode\extensions\ms-python.debugpy-2025.16.0-win32-x64\bundled\libs\debugpy\launcher' '56018' '--' 'E:\Silk Stuff\amazon\c12.py'
+
+===== Running N = 1000 =====
+Computing distance matrix (OpenCL if available)…
+[D-matrix] Using GPU via OpenCL.
+Distance matrix via GPU: time=0.44s
+Computing Christofides (k-NN graph)…
+[Christofides-KNN] Building k-NN graph with k=20
+[Christofides-KNN] Computing MST...
+[Christofides-KNN] Computing minimum-weight matching on odd nodes...
+[Christofides-KNN] Computing Eulerian circuit...
+Christofides(KNN) length: 12915.7153   time=60.11s
+Running MTS–Gamma C4…
+[C4] iteration 1: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -53.455429, i=656, j=670, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -34.573109, i=331, j=396, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -33.200775, i=86, j=985, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -30.216583, i=544, j=565, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -22.774540, i=437, j=446, elapsed 0.00s
+[C4] improvement 1: length 12741.4948 (Δ 174.2204), elapsed 0.09s
+[C4]   phase times: phase1 0.09s, 3-opt 0.00s
+[C4] iteration 2: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -20.125881, i=5, j=87, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -19.851170, i=534, j=623, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -16.501160, i=834, j=841, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -15.765672, i=904, j=913, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -15.239895, i=697, j=702, elapsed 0.00s
+[C4] improvement 2: length 12654.0110 (Δ 87.4838), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 3: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -15.179176, i=450, j=455, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -14.916473, i=509, j=563, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -24.826519, i=540, j=658, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -29.318504, i=549, j=691, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -24.450741, i=692, j=693, elapsed 0.00s
+[C4] improvement 3: length 12545.3196 (Δ 108.6914), elapsed 0.05s
+[C4]   phase times: phase1 0.05s, 3-opt 0.00s
+[C4] iteration 4: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -23.748798, i=600, j=774, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -13.965387, i=177, j=205, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -13.239002, i=601, j=603, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -13.021839, i=915, j=922, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -11.679615, i=428, j=432, elapsed 0.00s
+[C4] improvement 4: length 12469.6650 (Δ 75.6546), elapsed 0.05s
+[C4]   phase times: phase1 0.05s, 3-opt 0.00s
+[C4] iteration 5: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -11.401794, i=302, j=481, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -11.260145, i=408, j=409, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -10.820993, i=81, j=82, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -10.691212, i=857, j=863, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -10.160416, i=616, j=816, elapsed 0.00s
+[C4] improvement 5: length 12415.3304 (Δ 54.3346), elapsed 0.05s
+[C4]   phase times: phase1 0.05s, 3-opt 0.00s
+[C4] iteration 6: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -22.849081, i=525, j=676, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -9.447910, i=323, j=326, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -9.299339, i=469, j=471, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -9.064735, i=950, j=951, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -8.834028, i=665, j=666, elapsed 0.00s
+[C4] improvement 6: length 12355.8353 (Δ 59.4951), elapsed 0.04s
+[C4]   phase times: phase1 0.04s, 3-opt 0.00s
+[C4] iteration 7: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -8.583824, i=969, j=971, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -8.477169, i=711, j=712, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -8.462166, i=449, j=450, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -7.816662, i=852, j=856, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -7.633438, i=511, j=513, elapsed 0.00s
+[C4] improvement 7: length 12314.8621 (Δ 40.9733), elapsed 0.04s
+[C4]   phase times: phase1 0.04s, 3-opt 0.00s
+[C4] iteration 8: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -7.565928, i=65, j=67, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -7.119019, i=826, j=828, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -6.936409, i=895, j=897, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -7.043571, i=895, j=896, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -6.884422, i=852, j=855, elapsed 0.00s
+[C4] improvement 8: length 12279.3127 (Δ 35.5493), elapsed 0.04s
+[C4]   phase times: phase1 0.04s, 3-opt 0.00s
+[C4] iteration 9: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -6.850235, i=107, j=108, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -6.729584, i=222, j=223, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -6.427830, i=624, j=629, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -6.317909, i=805, j=814, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -6.218552, i=127, j=129, elapsed 0.00s
+[C4] improvement 9: length 12246.7686 (Δ 32.5441), elapsed 0.04s
+[C4]   phase times: phase1 0.04s, 3-opt 0.00s
+[C4] iteration 10: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -6.111038, i=48, j=55, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -5.996040, i=263, j=267, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -7.258408, i=263, j=265, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -5.894411, i=979, j=981, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -5.561493, i=731, j=732, elapsed 0.00s
+[C4] improvement 10: length 12215.9472 (Δ 30.8214), elapsed 0.04s
+[C4]   phase times: phase1 0.04s, 3-opt 0.00s
+[C4] iteration 11: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -5.422070, i=199, j=200, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -5.409460, i=866, j=867, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -5.090206, i=90, j=91, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -4.963404, i=626, j=628, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -4.804287, i=636, j=637, elapsed 0.00s
+[C4] improvement 11: length 12190.2578 (Δ 25.6894), elapsed 0.04s
+[C4]   phase times: phase1 0.04s, 3-opt 0.00s
+[C4] iteration 12: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -4.801666, i=151, j=154, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -4.350073, i=77, j=78, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -4.302402, i=435, j=437, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -4.294527, i=953, j=955, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -4.237990, i=249, j=250, elapsed 0.00s
+[C4] improvement 12: length 12168.2711 (Δ 21.9867), elapsed 0.04s
+[C4]   phase times: phase1 0.04s, 3-opt 0.00s
+[C4] iteration 13: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -4.164652, i=292, j=293, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -4.053680, i=417, j=419, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -7.760208, i=418, j=419, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -4.032799, i=424, j=425, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -3.907230, i=287, j=289, elapsed 0.00s
+[C4] improvement 13: length 12144.3526 (Δ 23.9186), elapsed 0.04s
+[C4]   phase times: phase1 0.04s, 3-opt 0.00s
+[C4] iteration 14: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -3.854168, i=580, j=581, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -3.720995, i=717, j=718, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -3.539516, i=975, j=976, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -3.498539, i=233, j=234, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -3.442318, i=179, j=180, elapsed 0.00s
+[C4] improvement 14: length 12126.2970 (Δ 18.0555), elapsed 0.04s
+[C4]   phase times: phase1 0.04s, 3-opt 0.00s
+[C4] iteration 15: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -3.423674, i=456, j=504, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -8.759243, i=457, j=505, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -3.371027, i=807, j=814, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -3.337971, i=465, j=467, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -6.808613, i=465, j=466, elapsed 0.00s
+[C4] improvement 15: length 12100.5965 (Δ 25.7005), elapsed 0.04s
+[C4]   phase times: phase1 0.04s, 3-opt 0.00s
+[C4] iteration 16: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -3.287308, i=501, j=502, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -3.268417, i=195, j=196, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -3.222818, i=997, j=998, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -3.181297, i=5, j=6, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -2.937256, i=742, j=743, elapsed 0.00s
+[C4] improvement 16: length 12084.6994 (Δ 15.8971), elapsed 0.04s
+[C4]   phase times: phase1 0.04s, 3-opt 0.00s
+[C4] iteration 17: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -2.860670, i=177, j=178, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -2.659039, i=780, j=781, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -2.622257, i=891, j=894, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -16.092602, i=891, j=893, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -2.535936, i=924, j=925, elapsed 0.00s
+[C4] improvement 17: length 12057.9289 (Δ 26.7705), elapsed 0.04s
+[C4]   phase times: phase1 0.04s, 3-opt 0.00s
+[C4] iteration 18: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -2.387663, i=413, j=414, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -2.188251, i=435, j=436, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -1.963261, i=849, j=850, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -1.869646, i=242, j=243, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -1.739704, i=639, j=640, elapsed 0.00s
+[C4] improvement 18: length 12047.7804 (Δ 10.1485), elapsed 0.04s
+[C4]   phase times: phase1 0.04s, 3-opt 0.00s
+[C4] iteration 19: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -1.683777, i=613, j=614, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -1.479513, i=50, j=51, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -1.367271, i=577, j=578, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -1.242538, i=454, j=455, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -1.158340, i=208, j=209, elapsed 0.00s
+[C4] improvement 19: length 12040.8489 (Δ 6.9314), elapsed 0.04s
+[C4]   phase times: phase1 0.04s, 3-opt 0.00s
+[C4] iteration 20: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -1.080204, i=104, j=105, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -0.984539, i=257, j=258, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -0.959215, i=37, j=38, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -0.952591, i=872, j=873, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -0.934599, i=559, j=560, elapsed 0.00s
+[C4] improvement 20: length 12035.9378 (Δ 4.9111), elapsed 0.04s
+[C4]   phase times: phase1 0.04s, 3-opt 0.00s
+[C4] iteration 21: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -0.795057, i=654, j=655, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -0.744875, i=267, j=268, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -0.712479, i=962, j=963, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -0.709394, i=668, j=669, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -0.691111, i=119, j=120, elapsed 0.00s
+[C4] improvement 21: length 12032.2849 (Δ 3.6529), elapsed 0.04s
+[C4]   phase times: phase1 0.04s, 3-opt 0.00s
+[GPU 2-opt] pass 1: best Δ = -0.613682, i=903, j=904, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -0.607346, i=498, j=499, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -0.528107, i=74, j=75, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -0.419437, i=140, j=141, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -0.283989, i=117, j=118, elapsed 0.00s
+[C4] improvement 22: length 12029.8323 (Δ 2.4526), elapsed 0.04s
+[C4]   phase times: phase1 0.04s, 3-opt 0.00s
+[C4] iteration 23: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -0.225563, i=160, j=161, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -0.221975, i=189, j=191, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -3.300707, i=189, j=190, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -0.174030, i=60, j=61, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -0.138008, i=174, j=212, elapsed 0.00s
+[C4] improvement 23: length 12025.7720 (Δ 4.0603), elapsed 0.04s
+[C4]   phase times: phase1 0.03s, 3-opt 0.00s
+[C4] iteration 24: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -5.290440, i=176, j=212, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -0.123999, i=34, j=35, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -0.002104, i=994, j=995, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -0.001019, i=616, j=617, elapsed 0.00s
+[GPU 2-opt] pass 5: no further improvement (elapsed 0.00s)
+[C4] improvement 24: length 12020.3545 (Δ 5.4176), elapsed 0.03s
+[C4]   phase times: phase1 0.03s, 3-opt 0.00s
+[C4] iteration 25: starting GPU 2-opt
+[GPU 2-opt] pass 1: no further improvement (elapsed 0.00s)
+[C4] iteration 25: no further improvement after 0.03s
+[C4]   phase times: phase1 0.03s, 3-opt 0.00s
+MTS–Γ C4 length:     12020.3545   time=1.12s
+
+Improvement over Christofides(KNN): 6.9323 %
+[Output] Final tour saved to c9_final_tour.csv
+PS E:\Silk Stuff\amazon>  e:; cd 'e:\Silk Stuff\amazon'; & 'c:\Python313\python.exe' 'c:\Users\Glyn\.vscode\extensions\ms-python.debugpy-2025.16.0-win32-x64\bundled\libs\debugpy\launcher' '56257' '--' 'E:\Silk Stuff\amazon\c12.py'
+
+===== Running N = 2000 =====
+Computing distance matrix (OpenCL if available)…
+[D-matrix] Using GPU via OpenCL.
+Distance matrix via GPU: time=0.38s
+Computing Christofides (k-NN graph)…
+[Christofides-KNN] Building k-NN graph with k=20
+[Christofides-KNN] Computing MST...
+[Christofides-KNN] Computing minimum-weight matching on odd nodes...
+[Christofides-KNN] Computing Eulerian circuit...
+Christofides(KNN) length: 18453.1740   time=426.50s
+Running MTS–Gamma C4…
+[C4] iteration 1: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -19.510036, i=701, j=923, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -17.897545, i=622, j=642, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -16.248150, i=1113, j=1146, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -12.779535, i=1679, j=1703, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -17.542740, i=1682, j=1779, elapsed 0.00s
+[C4] improvement 1: length 18369.1960 (Δ 83.9780), elapsed 0.09s
+[C4]   phase times: phase1 0.09s, 3-opt 0.00s
+[C4] iteration 2: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -12.601212, i=1674, j=1694, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -11.962126, i=356, j=387, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -11.761980, i=1317, j=1357, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -11.710855, i=1532, j=1534, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -11.221348, i=1786, j=1879, elapsed 0.00s
+[C4] improvement 2: length 18309.9385 (Δ 59.2575), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 3: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -19.451462, i=1836, j=1888, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -11.146816, i=1632, j=1639, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -11.084625, i=168, j=185, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -11.064413, i=377, j=379, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -10.995012, i=1327, j=1332, elapsed 0.00s
+[C4] improvement 3: length 18246.1962 (Δ 63.7423), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 4: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -10.649778, i=1618, j=1641, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -10.235886, i=429, j=430, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -10.005337, i=506, j=509, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -9.841169, i=317, j=392, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -9.106516, i=1099, j=1240, elapsed 0.00s
+[C4] improvement 4: length 18196.3575 (Δ 49.8387), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 5: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -15.653596, i=1071, j=1108, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -8.868415, i=314, j=358, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -8.777502, i=1376, j=1387, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -8.653954, i=243, j=278, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -8.637486, i=843, j=846, elapsed 0.00s
+[C4] improvement 5: length 18145.7665 (Δ 50.5910), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 6: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -8.583824, i=523, j=525, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -8.546112, i=598, j=661, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -10.030725, i=597, j=661, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -8.537689, i=1181, j=1228, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -8.482969, i=791, j=792, elapsed 0.00s
+[C4] improvement 6: length 18101.5852 (Δ 44.1813), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 7: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -8.329934, i=1366, j=1397, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -8.285278, i=1285, j=1310, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -8.237986, i=868, j=870, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -7.868179, i=375, j=376, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -7.815807, i=246, j=274, elapsed 0.00s
+[C4] improvement 7: length 18061.0480 (Δ 40.5372), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 8: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -7.710712, i=1850, j=1854, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -7.603178, i=205, j=207, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -7.468966, i=107, j=116, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -12.218231, i=107, j=115, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -7.312229, i=12, j=15, elapsed 0.00s
+[C4] improvement 8: length 18018.7347 (Δ 42.3133), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 9: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -7.233680, i=1550, j=1552, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -7.215422, i=1035, j=1036, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -7.118082, i=1194, j=1208, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -7.540936, i=1190, j=1208, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -6.978783, i=1805, j=1818, elapsed 0.00s
+[C4] improvement 9: length 17982.6478 (Δ 36.0869), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 10: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -6.938511, i=1806, j=1818, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -6.851597, i=1475, j=1476, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -6.844952, i=209, j=220, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -6.814928, i=100, j=101, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -6.501404, i=697, j=698, elapsed 0.00s
+[C4] improvement 10: length 17948.6964 (Δ 33.9514), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 11: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -6.410553, i=614, j=620, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -6.342688, i=1610, j=1613, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -6.323811, i=1452, j=1453, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -6.016076, i=374, j=381, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -5.926164, i=667, j=673, elapsed 0.00s
+[C4] improvement 11: length 17917.6771 (Δ 31.0193), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 12: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -5.912178, i=978, j=979, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -5.805775, i=372, j=397, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -5.764828, i=766, j=767, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -5.747473, i=553, j=556, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -5.524220, i=532, j=535, elapsed 0.00s
+[C4] improvement 12: length 17888.9226 (Δ 28.7545), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 13: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -5.444432, i=667, j=671, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -5.340296, i=1956, j=1958, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -5.257774, i=1899, j=1900, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -5.225304, i=142, j=150, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -6.181578, i=142, j=151, elapsed 0.00s
+[C4] improvement 13: length 17861.4733 (Δ 27.4494), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 14: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -5.199350, i=1004, j=1005, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -5.171721, i=25, j=26, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -5.158548, i=449, j=451, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -5.049757, i=994, j=997, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -4.917448, i=1030, j=1033, elapsed 0.00s
+[C4] improvement 14: length 17835.9764 (Δ 25.4968), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 15: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -4.861395, i=1135, j=1137, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -4.828388, i=1293, j=1295, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -4.804287, i=1496, j=1498, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -4.642120, i=288, j=289, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -4.602332, i=298, j=299, elapsed 0.00s
+[C4] improvement 15: length 17812.2379 (Δ 23.7385), elapsed 0.06s
+[C4]   phase times: phase1 0.05s, 3-opt 0.00s
+[C4] iteration 16: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -4.585421, i=708, j=709, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -4.533325, i=1102, j=1103, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -4.512701, i=1041, j=1042, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -4.490881, i=492, j=493, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -4.432619, i=225, j=226, elapsed 0.00s
+[C4] improvement 16: length 17789.6830 (Δ 22.5549), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 17: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -4.463160, i=227, j=228, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -4.411884, i=802, j=803, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -4.395775, i=1633, j=1636, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -4.386704, i=718, j=727, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -4.350002, i=1714, j=1715, elapsed 0.00s
+[C4] improvement 17: length 17767.6754 (Δ 22.0075), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 18: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -4.335518, i=95, j=97, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -4.295578, i=1485, j=1487, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -4.234934, i=304, j=306, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -4.131252, i=577, j=581, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -4.492882, i=582, j=585, elapsed 0.00s
+[C4] improvement 18: length 17746.1853 (Δ 21.4902), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 19: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -4.120089, i=1360, j=1361, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -4.033257, i=164, j=166, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -3.952816, i=1766, j=1767, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -3.931881, i=1645, j=1648, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -3.925331, i=178, j=179, elapsed 0.00s
+[C4] improvement 19: length 17726.2219 (Δ 19.9634), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 20: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -3.895172, i=1157, j=1159, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -3.885286, i=76, j=1979, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -8.291313, i=75, j=1979, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -3.879572, i=409, j=412, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -3.858406, i=567, j=568, elapsed 0.00s
+[C4] improvement 20: length 17702.4121 (Δ 23.8098), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 21: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -7.182501, i=568, j=569, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -3.748009, i=776, j=778, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -3.713840, i=1744, j=1751, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -3.702816, i=862, j=864, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -3.676062, i=1145, j=1146, elapsed 0.00s
+[C4] improvement 21: length 17680.3889 (Δ 22.0232), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 22: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -3.654055, i=1946, j=1947, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -3.649157, i=1055, j=1056, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -3.629042, i=1642, j=1645, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -3.839676, i=1646, j=1648, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -3.600660, i=1189, j=1190, elapsed 0.00s
+[C4] improvement 22: length 17662.0163 (Δ 18.3726), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 23: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -3.520714, i=484, j=487, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -3.482956, i=709, j=710, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -3.476328, i=771, j=772, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -3.462917, i=1121, j=1122, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -3.387257, i=518, j=540, elapsed 0.00s
+[C4] improvement 23: length 17644.6862 (Δ 17.3302), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 24: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -5.070511, i=519, j=540, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -3.305613, i=458, j=459, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -3.293247, i=68, j=69, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -3.281698, i=128, j=129, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -3.252180, i=197, j=198, elapsed 0.00s
+[C4] improvement 24: length 17626.4829 (Δ 18.2033), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 25: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -3.245878, i=1929, j=1930, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -3.222818, i=1997, j=1998, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -3.117268, i=1429, j=1434, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -5.341034, i=1431, j=1434, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -3.105027, i=1811, j=1813, elapsed 0.00s
+[C4] improvement 25: length 17608.4509 (Δ 18.0320), elapsed 0.06s
+[C4]   phase times: phase1 0.05s, 3-opt 0.00s
+[C4] iteration 26: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -3.102657, i=592, j=600, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -3.090084, i=79, j=82, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -3.076172, i=932, j=933, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -3.074387, i=1563, j=1565, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -3.037384, i=329, j=331, elapsed 0.00s
+[C4] improvement 26: length 17593.0702 (Δ 15.3807), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 27: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -3.020891, i=913, j=915, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -2.988573, i=1067, j=1068, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -2.988413, i=581, j=582, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -2.916918, i=1950, j=1951, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -2.909403, i=823, j=874, elapsed 0.00s
+[C4] improvement 27: length 17578.2460 (Δ 14.8242), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 28: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -13.122612, i=824, j=874, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -2.872929, i=806, j=807, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -2.871538, i=1243, j=1244, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -2.867199, i=893, j=894, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -2.847685, i=136, j=137, elapsed 0.00s
+[C4] improvement 28: length 17553.6640 (Δ 24.5820), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 29: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -2.815010, i=41, j=42, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -2.800140, i=1268, j=1269, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -2.793476, i=145, j=147, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -2.765667, i=1328, j=1329, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -2.750399, i=718, j=719, elapsed 0.00s
+[C4] improvement 29: length 17539.7393 (Δ 13.9247), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 30: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -2.689167, i=1854, j=1855, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -2.675560, i=1105, j=1125, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -11.505239, i=1105, j=1124, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -2.658509, i=214, j=215, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -2.595425, i=648, j=649, elapsed 0.00s
+[C4] improvement 30: length 17517.6154 (Δ 22.1239), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 31: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -2.586583, i=482, j=483, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -2.576719, i=496, j=497, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -2.573399, i=1418, j=1424, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -5.345850, i=1416, j=1424, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -2.532406, i=1617, j=1618, elapsed 0.00s
+[C4] improvement 31: length 17502.0005 (Δ 15.6150), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 32: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -2.526001, i=107, j=108, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -2.466190, i=951, j=953, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -2.439999, i=1102, j=1103, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -2.437366, i=1301, j=1302, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -2.414146, i=1824, j=1825, elapsed 0.00s
+[C4] improvement 32: length 17489.7168 (Δ 12.2837), elapsed 0.06s
+[C4]   phase times: phase1 0.05s, 3-opt 0.00s
+[C4] iteration 33: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -2.405666, i=1289, j=1291, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -2.392400, i=983, j=984, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -2.361382, i=517, j=518, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -2.357712, i=746, j=747, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -2.301023, i=1043, j=1045, elapsed 0.00s
+[C4] improvement 33: length 17477.8986 (Δ 11.8182), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 34: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -2.270683, i=621, j=625, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -2.258839, i=50, j=53, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -2.872918, i=50, j=52, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -2.229700, i=1740, j=1741, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -2.193462, i=152, j=153, elapsed 0.00s
+[C4] improvement 34: length 17466.0730 (Δ 11.8256), elapsed 0.06s
+[C4]   phase times: phase1 0.05s, 3-opt 0.00s
+[C4] iteration 35: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -2.167229, i=1456, j=1457, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -2.164845, i=1633, j=1635, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -2.981525, i=1634, j=1635, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -2.153318, i=322, j=323, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -2.149017, i=1976, j=1977, elapsed 0.00s
+[C4] improvement 35: length 17454.4571 (Δ 11.6159), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 36: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -2.145550, i=148, j=149, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -2.091782, i=1560, j=1561, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -2.080305, i=899, j=900, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -2.023567, i=993, j=995, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -2.375187, i=993, j=994, elapsed 0.00s
+[C4] improvement 36: length 17443.7407 (Δ 10.7164), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 37: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -1.963510, i=231, j=232, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -1.887154, i=1716, j=1719, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -1.883028, i=145, j=146, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -1.835667, i=1590, j=1591, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -1.810261, i=1342, j=1343, elapsed 0.00s
+[C4] improvement 37: length 17434.3610 (Δ 9.3796), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 38: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -1.772940, i=21, j=23, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -1.764153, i=1681, j=1682, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -1.753448, i=410, j=479, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -13.993872, i=409, j=477, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -1.701275, i=1567, j=1568, elapsed 0.00s
+[C4] improvement 38: length 17413.3754 (Δ 20.9857), elapsed 0.06s
+[C4]   phase times: phase1 0.05s, 3-opt 0.00s
+[C4] iteration 39: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -1.672440, i=1352, j=1353, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -1.669657, i=732, j=733, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -1.632010, i=1116, j=1117, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -1.579491, i=254, j=255, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -1.577944, i=1224, j=1225, elapsed 0.00s
+[C4] improvement 39: length 17405.2438 (Δ 8.1315), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 40: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -1.574286, i=1042, j=1044, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -1.560799, i=772, j=773, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -1.517342, i=1983, j=1987, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -5.316577, i=1983, j=1986, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -1.501339, i=736, j=737, elapsed 0.00s
+[C4] improvement 40: length 17393.7735 (Δ 11.4703), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 41: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -1.486351, i=1691, j=1692, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -1.474724, i=316, j=317, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -1.467838, i=1734, j=1736, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -1.437165, i=127, j=128, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -1.374519, i=1119, j=1121, elapsed 0.00s
+[C4] improvement 41: length 17386.5329 (Δ 7.2406), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 42: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -1.373505, i=945, j=946, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -1.285157, i=672, j=673, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -1.281710, i=760, j=761, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -1.247311, i=2, j=3, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -1.243872, i=307, j=308, elapsed 0.00s
+[C4] improvement 42: length 17380.1013 (Δ 6.4316), elapsed 0.05s
+[C4]   phase times: phase1 0.05s, 3-opt 0.00s
+[C4] iteration 43: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -1.186050, i=50, j=51, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -1.161255, i=211, j=212, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -1.126616, i=838, j=840, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -1.122351, i=759, j=784, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -5.025812, i=761, j=784, elapsed 0.00s
+[C4] improvement 43: length 17370.4792 (Δ 9.6221), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 44: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -1.096220, i=1763, j=1764, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -1.064899, i=163, j=164, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -1.032213, i=438, j=439, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -1.028336, i=735, j=738, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -1.013992, i=751, j=754, elapsed 0.00s
+[C4] improvement 44: length 17365.2436 (Δ 5.2357), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 45: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -1.012884, i=1521, j=1539, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -5.221752, i=1523, j=1540, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -1.001459, i=1290, j=1291, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -0.994286, i=189, j=191, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -0.990253, i=1795, j=1796, elapsed 0.00s
+[C4] improvement 45: length 17356.0229 (Δ 9.2206), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 46: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -2.558708, i=1797, j=1807, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -11.490307, i=1797, j=1808, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -0.983173, i=283, j=284, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -0.979149, i=925, j=926, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -0.971050, i=724, j=725, elapsed 0.00s
+[C4] improvement 46: length 17339.0405 (Δ 16.9824), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 47: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -0.956940, i=384, j=395, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -5.784079, i=384, j=394, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -0.955311, i=1341, j=1342, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -0.944000, i=937, j=938, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -0.895605, i=379, j=380, elapsed 0.00s
+[C4] improvement 47: length 17329.5046 (Δ 9.5359), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 48: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -0.878039, i=1169, j=1174, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -3.839933, i=1170, j=1174, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -0.869068, i=1106, j=1107, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -0.806751, i=1684, j=1685, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -0.788891, i=1014, j=1017, elapsed 0.00s
+[C4] improvement 48: length 17322.3219 (Δ 7.1827), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 49: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -0.783384, i=1955, j=1956, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -0.760401, i=1443, j=1444, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -0.749290, i=1886, j=1887, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -0.744538, i=1790, j=1791, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -0.719793, i=238, j=288, elapsed 0.00s
+[C4] improvement 49: length 17318.5645 (Δ 3.7574), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 50: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -14.163767, i=237, j=288, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -1.398658, i=287, j=288, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -1.478326, i=286, j=287, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -0.718590, i=1486, j=1510, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -7.859730, i=1486, j=1509, elapsed 0.00s
+[C4] improvement 50: length 17292.9455 (Δ 25.6191), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 51: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -0.717947, i=1142, j=1145, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -0.714419, i=928, j=929, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -0.677586, i=43, j=46, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -1.160892, i=44, j=46, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -0.658213, i=686, j=688, elapsed 0.00s
+[C4] improvement 51: length 17289.0164 (Δ 3.9291), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 52: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -4.166906, i=686, j=687, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -0.606589, i=1705, j=1706, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -0.583683, i=839, j=840, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -0.576351, i=576, j=577, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -0.557217, i=159, j=160, elapsed 0.00s
+[C4] improvement 52: length 17282.5257 (Δ 6.4907), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 53: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -0.541196, i=1913, j=1914, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -0.541149, i=102, j=104, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -0.628032, i=102, j=103, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -0.536555, i=701, j=702, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -0.483185, i=1839, j=1840, elapsed 0.00s
+[C4] improvement 53: length 17279.7955 (Δ 2.7301), elapsed 0.07s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 54: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -0.458532, i=668, j=669, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -0.396561, i=516, j=517, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -0.396532, i=1556, j=1557, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -0.380405, i=1537, j=1538, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -0.360317, i=1789, j=1790, elapsed 0.00s
+[C4] improvement 54: length 17277.8032 (Δ 1.9924), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 55: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -0.320591, i=1522, j=1523, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -0.302643, i=1143, j=1145, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -0.241444, i=391, j=392, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -0.240063, i=1734, j=1735, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -0.235172, i=409, j=410, elapsed 0.00s
+[C4] improvement 55: length 17276.4633 (Δ 1.3399), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 56: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -0.233288, i=1814, j=1815, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -0.223471, i=874, j=876, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -2.232264, i=874, j=875, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -0.216541, i=1686, j=1688, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -0.677189, i=1684, j=1688, elapsed 0.00s
+[C4] improvement 56: length 17272.8805 (Δ 3.5827), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 57: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -0.212454, i=320, j=321, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -0.205807, i=542, j=543, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -0.134199, i=768, j=769, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -0.132933, i=1869, j=1870, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -0.128376, i=1180, j=1230, elapsed 0.00s
+[C4] improvement 57: length 17272.0668 (Δ 0.8138), elapsed 0.06s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 58: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -4.054932, i=1182, j=1230, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -0.094357, i=373, j=374, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -0.093527, i=826, j=827, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -0.012526, i=530, j=531, elapsed 0.00s
+[GPU 2-opt] pass 5: best Δ = -0.010553, i=108, j=1891, elapsed 0.00s
+[C4] improvement 58: length 17267.8009 (Δ 4.2659), elapsed 0.07s
+[C4]   phase times: phase1 0.06s, 3-opt 0.00s
+[C4] iteration 59: starting GPU 2-opt
+[GPU 2-opt] pass 1: best Δ = -7.902914, i=107, j=1891, elapsed 0.00s
+[GPU 2-opt] pass 2: best Δ = -0.010120, i=1053, j=1056, elapsed 0.00s
+[GPU 2-opt] pass 3: best Δ = -7.995024, i=1053, j=1055, elapsed 0.00s
+[GPU 2-opt] pass 4: best Δ = -0.004108, i=676, j=677, elapsed 0.00s
+[GPU 2-opt] pass 5: no further improvement (elapsed 0.00s)
+[C4] improvement 59: length 17251.8887 (Δ 15.9122), elapsed 0.06s
+[C4]   phase times: phase1 0.05s, 3-opt 0.00s
+[C4] iteration 60: starting GPU 2-opt
+[GPU 2-opt] pass 1: no further improvement (elapsed 0.00s)
+[C4] iteration 60: no further improvement after 0.05s
+[C4]   phase times: phase1 0.04s, 3-opt 0.00s
+MTS–Γ C4 length:     17251.8887   time=3.58s
+
+Improvement over Christofides(KNN): 6.5099 %
+[Output] Final tour saved to c9_final_tour.csv
+
+
