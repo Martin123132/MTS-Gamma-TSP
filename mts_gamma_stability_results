@@ -1,0 +1,384 @@
+import numpy as np
+import time
+import csv
+import networkx as nx
+from networkx.algorithms import approximation as approx
+from numba import njit
+
+# ============================================================
+# CORE DEFINITIONS (NO DEPENDENCIES)
+# ============================================================
+
+GRID = 512
+
+@njit
+def dist(a, b):
+    return ((a[0]-b[0])**2 + (a[1]-b[1])**2)**0.5
+
+def tour_length(order, coords):
+    total = 0.0
+    for i in range(len(order)-1):
+        a = coords[order[i]]
+        b = coords[order[i+1]]
+        total += dist(a, b)
+    return total
+
+# ----------------------------
+# 2.5-opt
+# ----------------------------
+def two_point_five_opt(route, coords):
+    improved = True
+    n = len(route)
+
+    while improved:
+        improved = False
+        for i in range(1, n-2):
+            for j in range(i+2, n-1):
+
+                A, B = route[i-1], route[i]
+                C, D = route[j], route[j+1]
+
+                old = dist(coords[A], coords[B]) + dist(coords[C], coords[D])
+                new = dist(coords[A], coords[C]) + dist(coords[B], coords[D])
+
+                if new < old:
+                    route[i:j+1] = reversed(route[i:j+1])
+                    improved = True
+                    continue
+
+                new_route = route.copy()
+                node = new_route.pop(i)
+                new_route.insert(j, node)
+
+                if tour_length(new_route, coords) < tour_length(route, coords):
+                    route = new_route
+                    improved = True
+                    continue
+
+    return route
+
+# ----------------------------
+# 3-opt
+# ----------------------------
+def three_opt(route, coords):
+    n = len(route)
+
+    def seg_len(i, j):
+        return dist(coords[route[i]], coords[route[j]])
+
+    improved = True
+    while improved:
+        improved = False
+
+        for i in range(0, n - 3):
+            for j in range(i + 2, n - 2):
+                for k in range(j + 2, n - 1):
+
+                    old_cost = seg_len(i,i+1)+seg_len(j,j+1)+seg_len(k,k+1)
+
+                    r1 = route.copy()
+                    r1[i+1:j+1] = reversed(r1[i+1:j+1])
+                    c1 = (seg_len(i,i+1)+seg_len(j,j+1)+seg_len(k,k+1))
+
+                    r2 = route.copy()
+                    r2[j+1:k+1] = reversed(r2[j+1:k+1])
+                    c2 = (seg_len(i,i+1)+seg_len(j,j+1)+seg_len(k,k+1))
+
+                    r3 = route.copy()
+                    r3[i+1:j+1] = reversed(r3[i+1:j+1])
+                    r3[j+1:k+1] = reversed(r3[j+1:k+1])
+                    c3 = (seg_len(i,i+1)+seg_len(j,j+1)+seg_len(k,k+1))
+
+                    best = min(c1, c2, c3)
+                    if best < old_cost - 1e-12:
+                        if best == c1: route = r1
+                        elif best == c2: route = r2
+                        else: route = r3
+                        improved = True
+
+    return route
+
+# ----------------------------
+# FULL REFINEMENT (C4)
+# ----------------------------
+def mts_gamma_C4(coords):
+
+    # Initial naive ordering (sorted by x)
+    order = list(np.argsort(coords[:,0]))
+
+    # Refinement cycle
+    improved = True
+    old_len = tour_length(order, coords)
+
+    while improved:
+        improved = False
+
+        order = two_point_five_opt(order, coords)
+        order = three_opt(order, coords)
+
+        new_len = tour_length(order, coords)
+        if new_len < old_len:
+            improved = True
+            old_len = new_len
+
+    return order, old_len
+
+
+# ============================================================
+# STABILITY TEST PARAMETERS
+# ============================================================
+SEEDS = 50
+TEST_SIZES = [100, 300, 500, 1000]
+
+output_file = "mts_gamma_stability_results.csv"
+
+print("Running MTS–Γ C4 stability tests…\n")
+rows = [["N","Seed","Christofides","MTS_Gamma","Improvement_%","Runtime_sec"]]
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+for N in TEST_SIZES:
+    print(f"\n===== Testing N = {N} with {SEEDS} seeds =====")
+    
+    for seed in range(SEEDS):
+        np.random.seed(seed)
+        coords = np.random.rand(N,2)*(GRID-4)
+
+        # Christofides
+        G = nx.Graph()
+        for i in range(N):
+            for j in range(i+1, N):
+                G.add_edge(i, j, weight=float(dist(coords[i], coords[j])))
+
+        c_route = approx.christofides(G)
+        c_len = tour_length(c_route, coords)
+
+        # MTS Γ C4
+        start = time.time()
+        mts_route, mts_len = mts_gamma_C4(coords)
+        end = time.time()
+
+        imp = (c_len - mts_len)/c_len * 100
+        print(f"Seed {seed:02d}: +{imp:.2f}%")
+
+        rows.append([N, seed, c_len, mts_len, imp, end-start])
+
+# Write CSV
+with open(output_file, "w", newline="") as f:
+    csv.writer(f).writerows(rows)
+
+print("\nSaved stability results →", output_file)
+
+Running MTS–Γ C4 stability tests…
+
+
+===== Testing N = 100 with 50 seeds =====
+Seed 00: +5.67%
+Seed 01: +-5.40%
+Seed 02: +2.78%
+Seed 03: +-0.63%
+Seed 04: +2.58%
+Seed 05: +0.27%
+Seed 06: +-1.40%
+Seed 07: +-3.06%
+Seed 08: +1.14%
+Seed 09: +3.93%
+Seed 10: +3.78%
+Seed 11: +3.12%
+Seed 12: +1.97%
+Seed 13: +-6.11%
+Seed 14: +0.53%
+Seed 15: +4.13%
+Seed 16: +2.35%
+Seed 17: +2.87%
+Seed 18: +-0.94%
+Seed 19: +7.59%
+Seed 20: +1.34%
+Seed 21: +1.32%
+Seed 22: +0.07%
+Seed 23: +1.57%
+Seed 24: +-4.80%
+Seed 25: +3.18%
+Seed 26: +8.68%
+Seed 27: +6.23%
+Seed 28: +-2.34%
+Seed 29: +-1.80%
+Seed 30: +2.69%
+Seed 31: +0.19%
+Seed 32: +2.66%
+Seed 33: +4.47%
+Seed 34: +-1.15%
+Seed 35: +4.25%
+Seed 36: +1.31%
+Seed 37: +0.15%
+Seed 38: +4.64%
+Seed 39: +-2.09%
+Seed 40: +1.49%
+Seed 41: +6.71%
+Seed 42: +0.73%
+Seed 43: +5.75%
+Seed 44: +3.49%
+Seed 45: +1.06%
+Seed 46: +1.50%
+Seed 47: +2.15%
+Seed 48: +2.09%
+Seed 49: +7.03%
+
+===== Testing N = 300 with 50 seeds =====
+Seed 00: +-4.37%
+Seed 01: +2.98%
+Seed 02: +0.66%
+Seed 03: +-1.30%
+Seed 04: +-1.72%
+Seed 05: +0.24%
+Seed 06: +3.14%
+Seed 07: +7.14%
+Seed 08: +0.96%
+Seed 09: +0.35%
+Seed 10: +2.72%
+Seed 11: +-1.77%
+Seed 12: +3.28%
+Seed 13: +1.38%
+Seed 14: +-0.26%
+Seed 15: +3.27%
+Seed 16: +-3.37%
+Seed 17: +-1.46%
+Seed 18: +2.30%
+Seed 19: +2.67%
+Seed 20: +4.19%
+Seed 21: +-0.47%
+Seed 22: +2.14%
+Seed 23: +1.74%
+Seed 24: +-0.04%
+Seed 25: +-0.75%
+Seed 26: +-4.11%
+Seed 27: +-0.91%
+Seed 28: +2.00%
+Seed 29: +-2.93%
+Seed 30: +-0.01%
+Seed 31: +0.56%
+Seed 32: +0.84%
+Seed 33: +-0.91%
+Seed 34: +-1.39%
+Seed 35: +5.57%
+Seed 36: +0.96%
+Seed 37: +-0.32%
+Seed 38: +0.61%
+Seed 39: +1.19%
+Seed 40: +-0.19%
+Seed 41: +2.72%
+Seed 42: +-0.52%
+Seed 43: +1.51%
+Seed 44: +2.07%
+Seed 45: +-0.42%
+Seed 46: +-1.65%
+Seed 47: +-1.39%
+Seed 48: +2.68%
+Seed 49: +1.92%
+
+===== Testing N = 500 with 50 seeds =====
+Seed 00: +1.62%
+Seed 01: +1.24%
+Seed 02: +0.84%
+Seed 03: +0.72%
+Seed 04: +0.43%
+Seed 05: +2.84%
+Seed 06: +2.35%
+Seed 07: +2.22%
+Seed 08: +2.47%
+Seed 09: +-0.28%
+Seed 10: +1.24%
+Seed 11: +-1.75%
+Seed 12: +0.25%
+Seed 13: +0.97%
+Seed 14: +-2.36%
+Seed 15: +-1.82%
+Seed 16: +2.33%
+Seed 17: +-0.84%
+Seed 18: +0.82%
+Seed 19: +-1.27%
+Seed 20: +-0.48%
+Seed 21: +1.33%
+Seed 22: +-1.44%
+Seed 23: +1.33%
+Seed 24: +1.80%
+Seed 25: +1.68%
+Seed 26: +-2.74%
+Seed 27: +-1.18%
+Seed 28: +1.87%
+Seed 29: +0.37%
+Seed 30: +2.19%
+Seed 31: +-0.30%
+Seed 32: +3.65%
+Seed 33: +0.96%
+Seed 34: +-1.53%
+Seed 35: +-0.27%
+Seed 36: +-0.88%
+Seed 37: +1.32%
+Seed 38: +-1.84%
+Seed 39: +-0.51%
+Seed 40: +0.46%
+Seed 41: +2.38%
+Seed 42: +2.07%
+Seed 43: +0.63%
+Seed 44: +2.82%
+Seed 45: +3.57%
+Seed 46: +1.45%
+Seed 47: +-1.16%
+Seed 48: +-0.02%
+Seed 49: +-1.16%
+
+===== Testing N = 1000 with 50 seeds =====
+Seed 00: +0.52%
+Seed 01: +-0.96%
+Seed 02: +-1.44%
+Seed 03: +0.48%
+Seed 04: +1.19%
+Seed 05: +-0.11%
+Seed 06: +2.69%
+Seed 07: +-1.35%
+Seed 08: +1.75%
+Seed 09: +0.08%
+Seed 10: +2.09%
+Seed 11: +0.38%
+Seed 12: +0.17%
+Seed 13: +2.66%
+Seed 14: +-1.97%
+Seed 15: +1.01%
+Seed 16: +1.11%
+Seed 17: +1.13%
+Seed 18: +1.60%
+Seed 19: +1.37%
+Seed 20: +1.28%
+Seed 21: +1.03%
+Seed 22: +-1.42%
+Seed 23: +2.01%
+Seed 24: +0.77%
+Seed 25: +1.53%
+Seed 26: +0.57%
+Seed 27: +0.42%
+Seed 28: +1.11%
+Seed 29: +-0.11%
+Seed 30: +0.45%
+Seed 31: +1.91%
+Seed 32: +-0.81%
+Seed 33: +-0.47%
+Seed 34: +0.57%
+Seed 35: +2.53%
+Seed 36: +0.64%
+Seed 37: +-0.46%
+Seed 38: +2.05%
+Seed 39: +0.85%
+Seed 40: +1.86%
+Seed 41: +1.00%
+Seed 42: +-0.07%
+Seed 43: +0.03%
+Seed 44: +1.11%
+Seed 45: +0.44%
+Seed 46: +0.91%
+Seed 47: +3.10%
+Seed 48: +1.11%
+Seed 49: +-1.53%
+
+Saved stability results → mts_gamma_stability_results.csv
